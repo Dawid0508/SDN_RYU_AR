@@ -118,13 +118,9 @@ class FAMTARController(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(FAMTARController, self).__init__(*args, **kwargs)
-        self.logger.info("FAMTAR Controller uruchomiony")
         self.datapaths = {}  # Przechowywanie obiektów datapath
         self.fft_lock = threading.Lock() # Zamek do synchronizacji dostępu do FFT        
-        self.monitor_thread = threading.Thread(target=self._request_stats_loop, daemon=True)  # Wątek monitorujący
-        self.cleanup_thread = threading.Thread(target=self._cleanup_fft, daemon=True)  # Wątek czyszczący FFT
-        self.monitor_thread.start()  # Uruchomienie wątku monitorującego
-        self.cleanup_thread.start()  # Uruchomienie wątku czyszczącego FFT
+        self.thread = None
 
 
     def add_flow(self, datapath, match, actions, priority=1, idle_timeout=0, hard_timeout=0):
@@ -350,8 +346,10 @@ class FAMTARController(app_manager.RyuApp):
                 self.logger.debug(f"FFT po czyszczeniu: {fft}")
 
     # Uruchomienie monitoringu po starcie aplikacji
-    # def start(self):
-    #     super(FAMTARController, self).start()
-    #     self.logger.info("FAMTAR Controller uruchomiony")
-    #     self.thread = threading.Thread(target = self._request_stats) #Uruchomienie monitoringu
-    #     self.thread = threading.Thread(target=self._cleanup_fft) # Uruchomienie czyszczenia FFT
+    def start(self):
+        super(FAMTARController, self).start()
+        self.logger.info("FAMTAR Controller uruchomiony")
+        self.monitor_thread = threading.Thread(target = self._request_stats) #Uruchomienie monitoringu
+        self.cleanup_thread = threading.Thread(target=self._cleanup_fft) # Uruchomienie czyszczenia FFT
+        self.monitor_thread.start()
+        self.monitor_thread.start()
