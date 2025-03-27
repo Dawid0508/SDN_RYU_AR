@@ -118,9 +118,14 @@ class FAMTARController(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(FAMTARController, self).__init__(*args, **kwargs)
+        self.logger.info("FAMTAR Controller uruchomiony")
         self.datapaths = {}  # Przechowywanie obiektów datapath
-        self.fft_lock = threading.Lock() # Zamek do synchronizacji dostępu do FFT
-        self.thread = threading.Thread(target=self.start) # Wątek monitorujący
+        self.fft_lock = threading.Lock() # Zamek do synchronizacji dostępu do FFT        
+        self.monitor_thread = threading.Thread(target=self._request_stats_loop, daemon=True)  # Wątek monitorujący
+        self.cleanup_thread = threading.Thread(target=self._cleanup_fft, daemon=True)  # Wątek czyszczący FFT
+        self.monitor_thread.start()  # Uruchomienie wątku monitorującego
+        self.cleanup_thread.start()  # Uruchomienie wątku czyszczącego FFT
+
 
     def add_flow(self, datapath, match, actions, priority=1, idle_timeout=0, hard_timeout=0):
         ofproto = datapath.ofproto
@@ -323,6 +328,7 @@ class FAMTARController(app_manager.RyuApp):
 
     #Żądanie statystyk przepływów
     def _request_stats(self):
+        """Pętla wysyłająca cyklicznie żądania statystyk przepływów."""
         for datapath in self.datapaths.values():
             ofproto = datapath.ofproto
             parser = datapath.ofproto_parser
@@ -331,6 +337,7 @@ class FAMTARController(app_manager.RyuApp):
             
     # Funkcja czyszcząca FFT
     def _cleanup_fft(self):
+        """Czyszczenie przestarzałych wpisów w FFT."""
         while True:
             time.sleep(CLEANUP_INTERVAL)
             with self.fft_lock:
@@ -343,8 +350,8 @@ class FAMTARController(app_manager.RyuApp):
                 self.logger.debug(f"FFT po czyszczeniu: {fft}")
 
     # Uruchomienie monitoringu po starcie aplikacji
-    def start(self):
-        super(FAMTARController, self).start()
-        self.logger.info("FAMTAR Controller uruchomiony")
-        self.thread.spawn(self._request_stats) #Uruchomienie monitoringu
-        self.thread.spawn(self._cleanup_fft) # Uruchomienie czyszczenia FFT
+    # def start(self):
+    #     super(FAMTARController, self).start()
+    #     self.logger.info("FAMTAR Controller uruchomiony")
+    #     self.thread = threading.Thread(target = self._request_stats) #Uruchomienie monitoringu
+    #     self.thread = threading.Thread(target=self._cleanup_fft) # Uruchomienie czyszczenia FFT
