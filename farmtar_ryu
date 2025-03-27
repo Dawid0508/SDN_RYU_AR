@@ -120,6 +120,7 @@ class FAMTARController(app_manager.RyuApp):
         super(FAMTARController, self).__init__(*args, **kwargs)
         self.datapaths = {}  # Przechowywanie obiektów datapath
         self.fft_lock = threading.Lock() # Zamek do synchronizacji dostępu do FFT
+        self.thread = threading.Thread(target=self.start) # Wątek monitorujący
 
     def add_flow(self, datapath, match, actions, priority=1, idle_timeout=0, hard_timeout=0):
         ofproto = datapath.ofproto
