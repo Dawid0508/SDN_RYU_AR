@@ -22,7 +22,7 @@ IDLE_TIMEOUT = 100  # Czas (sekundy) po którym wpis w FFT jest uznawany za prze
 CLEANUP_INTERVAL = 60 # Interwał czyszczenia FFT (sekundy)
 
 # Struktury Danych 
-switches = {}
+switches = []
 adjacency = defaultdict(lambda: defaultdict(lambda: {"port": None, "cost": DEFAULT_COST}))
 link_load = defaultdict(lambda: {"tx_bytes": 0, "rx_bytes": 0, "timestamp": 0}) # Monitorowanie obciążenia łącza
 fft = {} # Flow Forwarding Table: flow_id -> out_port
@@ -352,4 +352,4 @@ class FAMTARController(app_manager.RyuApp):
         self.monitor_thread = threading.Thread(target = self._request_stats) #Uruchomienie monitoringu
         self.cleanup_thread = threading.Thread(target=self._cleanup_fft) # Uruchomienie czyszczenia FFT
         self.monitor_thread.start()
-        self.monitor_thread.start()
+        self.cleanup_thread.start()
