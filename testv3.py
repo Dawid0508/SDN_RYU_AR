@@ -12,16 +12,15 @@ from subprocess import call
 
 def myNetwork():
 
-    net = Mininet( topo=None,
-                   build=False,
-                   ipBase='10.0.0.0/8')
+    net = Mininet(controller=RemoteController, build=False,
+                switch=OVSKernelSwitch, link=TCLink)
 
     info( '*** Adding controller\n' )
     c0=net.addController(name='c0',
-                      controller=RemoteController,
-                      ip='127.0.0.1',
-                      protocol='tcp',
-                      port=6633)
+                    controller=RemoteController,
+                    ip='127.0.0.1',
+                    protocol='tcp',
+                    port=6633)
 
     info( '*** Add switches\n')
     s3 = net.addSwitch('s3', cls=OVSKernelSwitch)
@@ -31,20 +30,26 @@ def myNetwork():
     s5 = net.addSwitch('s5', cls=OVSKernelSwitch)
 
     info( '*** Add hosts\n')
-    h2 = net.addHost('h2', cls=Host, ip='10.0.0.2', defaultRoute=None)
-    h1 = net.addHost('h1', cls=Host, ip='10.0.0.1', defaultRoute=None)
+    h2 = net.addHost('h2', cls=Host, ip='10.0.0.2', mac='00:00:00:00:00:01')
+    h1 = net.addHost('h1', cls=Host, ip='10.0.0.1',  mac='00:00:00:00:00:02')
+
+    # Definiowanie opcji dla łączy
+    # Niska przepustowość między przełącznikami (np. 10 Mbps) dla łatwiejszego testowania obciążenia
+    link_opts_sw = dict(bw=10)
+    # Wyższa przepustowość dla hostów (np. 100 Mbps)
+    link_opts_host = dict(bw=100)
 
     info( '*** Add links\n')
-    net.addLink(h1, s1)
-    net.addLink(s1, s2)
-    net.addLink(s1, s3)
-    net.addLink(s3, s5)
-    net.addLink(s3, s4)
-    net.addLink(s2, s4)
-    net.addLink(s4, h2)
-    net.addLink(s1, s5)
-    net.addLink(s5, s2)
-    net.addLink(s5, s4)
+    net.addLink(h1, s1, **link_opts_host)
+    net.addLink(s1, s2, **link_opts_sw)
+    net.addLink(s1, s3, **link_opts_host)
+    net.addLink(s3, s5, **link_opts_host)
+    net.addLink(s3, s4, **link_opts_sw)
+    net.addLink(s2, s4, **link_opts_sw)
+    net.addLink(s4, h2, **link_opts_host)
+    net.addLink(s1, s5, **link_opts_sw)
+    net.addLink(s5, s2, **link_opts_sw)
+    net.addLink(s5, s4, **link_opts_sw)
 
     info( '*** Starting network\n')
     net.build()
