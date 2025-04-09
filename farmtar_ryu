@@ -173,7 +173,7 @@ class FAMTARController(app_manager.RyuApp):
 
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, match, actions, priority=1) #Przechwytywanie wszystkich pakietów do kontrolera, ##tu zmienilem z 0-> 1
+        self.add_flow(datapath, match, actions, priority=0) #Przechwytywanie wszystkich pakietów do kontrolera, ##tu zmienilem z 0-> 1
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):    
@@ -273,7 +273,7 @@ class FAMTARController(app_manager.RyuApp):
         ofproto = switch.dp.ofproto
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(switch.dp, match, actions, priority=1) ##tu zmienilem z 0-> 1
+        self.add_flow(switch.dp, match, actions, priority=0) ##tu zmienilem z 0-> 1
         self.logger.info(f"Zainstalowano domyślny flow na przełączniku {switch.dp.id}")
 
     @set_ev_cls(event.EventSwitchLeave)
@@ -401,4 +401,4 @@ class FAMTARController(app_manager.RyuApp):
             parser = dp.ofproto_parser
             match = parser.OFPMatch()
             actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-            self.add_flow(dp, match, actions, priority=1)  ##tu zmienilem z 0-> 1
+            self.add_flow(dp, match, actions, priority=0)  ##tu zmienilem z 0-> 1
