@@ -313,10 +313,13 @@ class FAMTARController(app_manager.RyuApp):
         body = ev.msg.body
         datapath = ev.msg.datapath
 
-        for stat in sorted([flow for flow in body if flow.priority == 1],
-                        key=lambda flow: (flow.match['in_port'], flow.match['eth_dst'])): #Sortowanie statystyk
-            src_port = stat.match['in_port']
-            dst_mac = stat.match['eth_dst']
+        for stat in body:
+            if stat.priority != 1:
+                continue
+            in_port = stat.match.get('in_port')
+            dst_mac = stat.match.get('eth_dst')
+            if in_port is None or dst_mac is None:
+                continue  # Pomijamy niepełne wpisy
 
             # Znajdź port wyjściowy w topologii (jeśli istnieje)
             dst_port = None
@@ -325,36 +328,30 @@ class FAMTARController(app_manager.RyuApp):
                     dst_port = adjacency[datapath.id][sw]["port"]
 
             if dst_port is None:
-                continue #Nie znaleziono portu docelowego
+                continue  # Nie znaleziono portu docelowego
 
-            link = (datapath.id, dst_port) # Identyfikacja łącza
+            link = (datapath.id, dst_port)  # Identyfikacja łącza
             current_time = time.time()
             tx_bytes = stat.byte_count
 
-            #Obliczanie obciążenia łącza
             if link in link_load:
                 old_tx_bytes = link_load[link]["tx_bytes"]
                 old_timestamp = link_load[link]["timestamp"]
                 duration = current_time - old_timestamp
                 if duration > 0:
-                    load = (tx_bytes - old_tx_bytes) * 8 / duration  # Obciążenie w bitach/s
-                    capacity = 1000000000 #Przykladowa przepustowosc 1Gbps.  Zmień na rzeczywistą pojemność łącza
+                    load = (tx_bytes - old_tx_bytes) * 8 / duration
+                    capacity = 1000000000  # 1 Gbps
 
-                    #Aktualizacja kosztów łączy
                     if load > TRESHOLD_HIGH * capacity and adjacency[datapath.id][dst_port]["cost"] != MAX_COST:
                         adjacency[datapath.id][dst_port]["cost"] = MAX_COST
                         self.logger.warning(f"Łącze {datapath.id}->{dst_port} obciążone. Zmiana kosztu na {MAX_COST}")
                     elif load < TRESHOLD_LOW * capacity and adjacency[datapath.id][dst_port]["cost"] == MAX_COST:
                         adjacency[datapath.id][dst_port]["cost"] = DEFAULT_COST
-                        self.logger.info(f"Łącze {datapath.id}->{dst_port} zwolnione.  Przywrócenie kosztu do {DEFAULT_COST}")
-                else:
-                    load = 0
+                        self.logger.info(f"Łącze {datapath.id}->{dst_port} zwolnione. Przywrócenie kosztu do {DEFAULT_COST}")
 
-            # Aktualizacja informacji o łącze
             link_load[link]["tx_bytes"] = tx_bytes
             link_load[link]["timestamp"] = current_time
 
-        # Wysłanie żądania o statystyki ponownie
         self._request_stats()
 
     #Żądanie statystyk przepływów

@@ -30,6 +30,7 @@ switches = []
 adjacency = defaultdict(lambda: defaultdict(lambda: {"port": None, "cost": DEFAULT_COST}))
 link_load = defaultdict(lambda: {"tx_bytes": 0, "rx_bytes": 0, "timestamp": 0}) # Monitorowanie obciążenia łącza
 fft = {} # Flow Forwarding Table: flow_id -> out_port
+mac_to_dpid = {}  # mapowanie MAC -> DPID
 
 def minimum_distance(distance, Q):
     min_dist = float('inf')
@@ -74,7 +75,8 @@ def calculate_path(src, dst):
         if current == src:       # Jeśli dotarcie do źródła to koniec
             path.insert(0, current)
             break
-    
+    self.logger.info(f"Obliczona ścieżka {path} dla {src} → {dst}")
+
     if path[0] != src:
         return None # Brak ścieżki
     return path
@@ -171,14 +173,12 @@ class FAMTARController(app_manager.RyuApp):
 
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, match, actions, priority=0) #Przechwytywanie wszystkich pakietów do kontrolera
+        self.add_flow(datapath, match, actions, priority=1) #Przechwytywanie wszystkich pakietów do kontrolera, ##tu zmienilem z 0-> 1
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, ev):
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP or dst_mac == 'ff:ff:ff:ff:ff:ff':
-            return  # Ignoruj LLDP i pakiety broadcast
-        
+    def packet_in_handler(self, ev):    
         # Obsługa przychodzących pakietów
+        self.logger.info(f"Odebrano PacketIn z przełącznika {dpid}, in_port={in_port}")
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -188,7 +188,7 @@ class FAMTARController(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP or eth.dst == 'ff:ff:ff:ff:ff:ff':
             return  # Ignorowanie LLDP
 
         dst_mac = eth.dst
@@ -212,9 +212,26 @@ class FAMTARController(app_manager.RyuApp):
                 datapath.send_msg(out)
                 return
 
-         # Przepływ nieznany - oblicz ścieżkę
-        path = calculate_path(dpid, dst_mac)
+            # Naucz MAC->DPID
+        if src_mac not in mac_to_dpid:
+            mac_to_dpid[src_mac] = dpid
+            self.logger.info(f"mac_to_dpid = {mac_to_dpid}")
 
+            
+        if dst_mac not in mac_to_dpid:
+            self.logger.warning(f"Nieznany MAC docelowy {dst_mac}, zalewanie.")
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+            data = None
+            if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                data = msg.data
+                out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                in_port=in_port, actions=actions, data=data)
+            datapath.send_msg(out)
+            return
+        
+        dst_dpid = mac_to_dpid[dst_mac]
+        path = calculate_path(dpid, dst_dpid)
+            
         if path:
             ports = get_ports(path)
             self.install_path(ports, flow_id, ev, src_mac, dst_mac)
@@ -246,6 +263,14 @@ class FAMTARController(app_manager.RyuApp):
         switch = ev.switch
         switches.append(switch.dp.id)
         self.logger.info(f"Przełącznik dodany: {switch.dp.id}")
+        
+        # <<<<< FORCE ADD DEFAULT FLOW >>>>>
+        parser = switch.dp.ofproto_parser
+        ofproto = switch.dp.ofproto
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow(switch.dp, match, actions, priority=1) ##tu zmienilem z 0-> 1
+        self.logger.info(f"Zainstalowano domyślny flow na przełączniku {switch.dp.id}")
 
     @set_ev_cls(event.EventSwitchLeave)
     def switch_leave_handler(self, ev):
@@ -289,7 +314,7 @@ class FAMTARController(app_manager.RyuApp):
         datapath = ev.msg.datapath
 
         for stat in sorted([flow for flow in body if flow.priority == 1],
-                        key=lambda flow: (flow.match['in_port'], flow.match['eth_dst'])): #Sortowanie statystyk
+                        key=lambda flow: (flow.match['in_port'], flow.match.get['eth_dst'])): #Sortowanie statystyk
             src_port = stat.match['in_port']
             dst_mac = stat.match['eth_dst']
 
@@ -335,12 +360,15 @@ class FAMTARController(app_manager.RyuApp):
     #Żądanie statystyk przepływów
     def _request_stats(self):
         """Pętla wysyłająca cyklicznie żądania statystyk przepływów."""
-        for datapath in self.datapaths.values():
-            ofproto = datapath.ofproto
-            parser = datapath.ofproto_parser
-            req = parser.OFPFlowStatsRequest(datapath)
-            datapath.send_msg(req)
-            
+        while True:
+            for datapath in self.datapaths.values():
+                ofproto = datapath.ofproto
+                parser = datapath.ofproto_parser
+                req = parser.OFPFlowStatsRequest(datapath)
+                datapath.send_msg(req)
+                self.logger.debug(f"Wysłano żądanie statystyk do {datapath.id}")
+            time.sleep(30)  # Czas oczekiwania przed kolejnym żądaniem
+        
     # Funkcja czyszcząca FFT
     def _cleanup_fft(self):
         """Czyszczenie przestarzałych wpisów w FFT."""
@@ -363,3 +391,13 @@ class FAMTARController(app_manager.RyuApp):
         self.cleanup_thread = threading.Thread(target=self._cleanup_fft) # Uruchomienie czyszczenia FFT
         self.monitor_thread.start()
         self.cleanup_thread.start()
+        
+            # Force default flow rule if switch_features_handler missed
+        time.sleep(1)  # Poczekaj na połączenia
+        for dp in self.datapaths.values():
+            self.logger.info(f"Force adding default flow to switch {dp.id}")
+            ofproto = dp.ofproto
+            parser = dp.ofproto_parser
+            match = parser.OFPMatch()
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+            self.add_flow(dp, match, actions, priority=1)  ##tu zmienilem z 0-> 1
