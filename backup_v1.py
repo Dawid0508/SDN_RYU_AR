@@ -175,6 +175,9 @@ class FAMTARController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP or dst_mac == 'ff:ff:ff:ff:ff:ff':
+            return  # Ignoruj LLDP i pakiety broadcast
+        
         # Obsługa przychodzących pakietów
         msg = ev.msg
         datapath = msg.datapath
