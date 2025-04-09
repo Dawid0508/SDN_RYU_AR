@@ -179,6 +179,7 @@ class FAMTARController(app_manager.RyuApp):
     def packet_in_handler(self, ev):    
         # Obsługa przychodzących pakietów
         self.logger.info(f"Odebrano PacketIn z przełącznika {dpid}, in_port={in_port}")
+        self.logger.info(f"PACKET_IN: switch={datapath.id}, in_port={in_port}, src={eth.src}, dst={eth.dst}")
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -231,6 +232,8 @@ class FAMTARController(app_manager.RyuApp):
         
         dst_dpid = mac_to_dpid[dst_mac]
         path = calculate_path(dpid, dst_dpid)
+        self.logger.info(f"PATH: {path}")
+
             
         if path:
             ports = get_ports(path)
