@@ -121,6 +121,39 @@ def get_ports(path):
     # Dla routingu między przełącznikami, możemy zwrócić tylko porty między nimi
     return ports
 
+########### to dodalem 
+
+def calculate_flow_id(packet, in_port, eth_src, eth_dst):
+    # Obliczanie ID przepływu na podstawie 5-krotki
+    ip_proto = 0
+    src_port = 0
+    dst_port = 0
+
+    try:
+        # próba wydobycia informacji IP
+        # UŻYWAMY KLAS ipv4.ipv4 i ipv6.ipv6
+        ip_header = packet.get_protocol(ipv4.ipv4) or packet.get_protocol(ipv6.ipv6)
+        if ip_header:
+            ip_proto = ip_header.proto
+            # wydobycie informacji TCP/UDP
+            # UŻYWAMY KLAS tcp.tcp i udp.udp
+            tcp_header = packet.get_protocol(tcp.tcp)
+            udp_header = packet.get_protocol(udp.udp)
+
+            if tcp_header:
+                src_port = tcp_header.src_port
+                dst_port = tcp_header.dst_port
+            elif udp_header:
+                src_port = udp_header.src_port
+                dst_port = udp_header.dst_port
+    except Exception as e:
+        # Dodajmy bardziej szczegółowy log błędu
+        self.logger.error(f"Wyjątek podczas parsowania pakietu dla flow_id: {e}", exc_info=True) # exc_info=True pokaże pełny traceback
+
+    flow_tuple = (eth_src, eth_dst, ip_proto, src_port, dst_port, in_port)
+    flow_id = hashlib.md5(str(flow_tuple).encode('utf-8')).hexdigest()
+    return flow_id
+
 # --- Główna Klasa Kontrolera ---
 class FAMTARController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -440,8 +473,8 @@ class FAMTARController(app_manager.RyuApp):
         super(FAMTARController, self).start() # Ważne: wywołanie start() z klasy nadrzędnej
         self.logger.info("FAMTAR Controller uruchomiony")
         # Uzywamy self.spawn do uruchamiania watkow w tle zarzadzanych przez Ryu
-        self.monitor_thread = threading.Thread(target = self._request_stats) #Uruchomienie monitoringu
-        self.cleanup_thread = threading.Thread(target=self._cleanup_fft) # Uruchomienie czyszczenia FFT
+        self.monitor_thread = threading.Thread(target = self._request_stats_loop) #Uruchomienie monitoringu
+        self.cleanup_thread = threading.Thread(target=self._cleanup_fft_loop) # Uruchomienie czyszczenia FFT
         self.monitor_thread.start()
         self.cleanup_thread.start()
         self.logger.info("Watki monitoringu i czyszczenia FFT uruchomione przez spawn.")
