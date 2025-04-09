@@ -186,9 +186,6 @@ class FAMTARController(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
-        
-        self.logger.info(f"Odebrano PacketIn z przełącznika {dpid}, in_port={in_port}")
-        self.logger.info(f"PACKET_IN: switch={datapath.id}, in_port={in_port}, src={eth.src}, dst={eth.dst}")
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP or eth.dst == 'ff:ff:ff:ff:ff:ff':
             return  # Ignorowanie LLDP
@@ -197,6 +194,9 @@ class FAMTARController(app_manager.RyuApp):
         src_mac = eth.src
         dpid = datapath.id
 
+        self.logger.info(f"Odebrano PacketIn z przełącznika {dpid}, in_port={in_port}")
+        self.logger.info(f"PACKET_IN: switch={datapath.id}, in_port={in_port}, src={eth.src}, dst={eth.dst}")
+        
         flow_id = calculate_flow_id(pkt, in_port, src_mac, dst_mac)
 
         with self.fft_lock:
