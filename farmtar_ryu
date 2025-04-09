@@ -259,6 +259,14 @@ class FAMTARController(app_manager.RyuApp):
         switch = ev.switch
         switches.append(switch.dp.id)
         self.logger.info(f"Przełącznik dodany: {switch.dp.id}")
+        
+        # <<<<< FORCE ADD DEFAULT FLOW >>>>>
+        parser = switch.dp.ofproto_parser
+        ofproto = switch.dp.ofproto
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow(switch.dp, match, actions, priority=0)
+        self.logger.info(f"Zainstalowano domyślny flow na przełączniku {dpid}")
 
     @set_ev_cls(event.EventSwitchLeave)
     def switch_leave_handler(self, ev):
