@@ -94,15 +94,17 @@ def calculate_flow_id(packet, in_port, eth_src, eth_dst):
     ip_proto = 0
     src_port = 0
     dst_port = 0
-    
+
     try:
         # próba wydobycia informacji IP
-        ip_header = packet.get_protocol('ipv4') or packet.get_protocol('ipv6')
+        # UŻYWAMY KLAS ipv4.ipv4 i ipv6.ipv6
+        ip_header = packet.get_protocol(ipv4.ipv4) or packet.get_protocol(ipv6.ipv6)
         if ip_header:
             ip_proto = ip_header.proto
             # wydobycie informacji TCP/UDP
-            tcp_header = packet.get_protocol('tcp')
-            udp_header = packet.get_protocol('udp')
+            # UŻYWAMY KLAS tcp.tcp i udp.udp
+            tcp_header = packet.get_protocol(tcp.tcp)
+            udp_header = packet.get_protocol(udp.udp)
 
             if tcp_header:
                 src_port = tcp_header.src_port
@@ -111,7 +113,8 @@ def calculate_flow_id(packet, in_port, eth_src, eth_dst):
                 src_port = udp_header.src_port
                 dst_port = udp_header.dst_port
     except Exception as e:
-        print(f"Wyjątek podczas parsowania pakietu: {e}", exc_info=True)
+        # Dodajmy bardziej szczegółowy log błędu
+        self.logger.error(f"Wyjątek podczas parsowania pakietu dla flow_id: {e}", exc_info=True) # exc_info=True pokaże pełny traceback
 
     flow_tuple = (eth_src, eth_dst, ip_proto, src_port, dst_port, in_port)
     flow_id = hashlib.md5(str(flow_tuple).encode('utf-8')).hexdigest()
@@ -206,12 +209,8 @@ class FAMTARController(app_manager.RyuApp):
                 datapath.send_msg(out)
                 return
 
-        # Przepływ nieznany - oblicz ścieżkę i zainstaluj przepływy
-        if dst_mac in mac_to_dpid:
-            dst_dpid = mac_to_dpid[dst_mac]
-            path = calculate_path(dpid, dst_dpid) # Kieruj na przełącznik docelowy
-        else:
-            path = None # Nie znamy lokalizacji hosta docelowego
+         # Przepływ nieznany - oblicz ścieżkę
+        path = calculate_path(dpid, dst_mac)
 
         if path:
             ports = get_ports(path)

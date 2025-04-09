@@ -12,116 +12,124 @@ from collections import defaultdict
 import time
 import hashlib
 import threading
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import ipv6
+from ryu.lib.packet import tcp
+from ryu.lib.packet import udp
 
-# Konfiguracja 
-TRESHOLD_HIGH = 0.9     # Próg obciążenia powyżej którego łącze jest oznaczane jako obciążone
-TRESHOLD_LOW = 0.7      # Próg obciążenia poniżej którego łącze wraca do normalnego kosztu
+# --- Konfiguracja ---
+THRESHOLD_HIGH = 0.9     # Próg obciążenia powyżej którego łącze jest oznaczane jako obciążone
+THRESHOLD_LOW = 0.7      # Próg obciążenia poniżej którego łącze wraca do normalnego kosztu
 MAX_COST = 1000         # Maksymalny koszt łącza obciążonego
 DEFAULT_COST = 1        # Domyślny koszt łącza
-IDLE_TIMEOUT = 100  # Czas (sekundy) po którym wpis w FFT jest uznawany za przestarzały
-CLEANUP_INTERVAL = 60 # Interwał czyszczenia FFT (sekundy)
+IDLE_TIMEOUT = 100      # Czas (sekundy) bezczynności przepływu przed usunięciem z przełącznika
+FFT_IDLE_TIMEOUT = 120  # Czas (sekundy) bezczynności wpisu w FFT przed usunięciem przez cleanup
+CLEANUP_INTERVAL = 60   # Interwał czyszczenia FFT (sekundy)
+STATS_REQUEST_INTERVAL = 10 # Interwał żądania statystyk (sekundy)
 
-# Struktury Danych 
-switches = []
-adjacency = defaultdict(lambda: defaultdict(lambda: {"port": None, "cost": DEFAULT_COST}))
+# --- Struktury Danych ---
+switches = []           # Lista DPID przełączników
+adjacency = defaultdict(lambda: defaultdict(lambda: {"port": None, "cost": DEFAULT_COST})) # Macierz sąsiedztwa i kosztów
 link_load = defaultdict(lambda: {"tx_bytes": 0, "rx_bytes": 0, "timestamp": 0}) # Monitorowanie obciążenia łącza
-fft = {} # Flow Forwarding Table: flow_id -> out_port
+fft = {}                # Flow Forwarding Table: flow_id -> (out_port, timestamp)
+mac_to_dpid = {}        # <<<--- DODANE: Mapowanie MAC hosta -> DPID przełącznika, do którego jest podłączony
 
+# --- Funkcje Pomocnicze ---
 def minimum_distance(distance, Q):
     min_dist = float('inf')
     min_node = None
-    
     for node in Q:
-        if distance[node] < min_dist:
+        # Upewnij się, że node istnieje w distance przed dostępem
+        if node in distance and distance[node] < min_dist:
             min_dist = distance[node]
             min_node = node
     return min_node
 
 def calculate_path(src, dst):
-    # Algorytm Dijkstry  z uwzględnieniem dynamicznych kosztów łączy
-    # Inicjalizacja odległości do wszystkich węzłów jako nieskończoność
-    # oraz poprzedników jako None
+    # Sprawdzenie czy src i dst są w liście znanych przełączników
+    if src not in switches or dst not in switches:
+        # Logowanie błędu lub zwrócenie None, jeśli przełączniki nie są znane
+        # self.logger.warning(f"Próba obliczenia ścieżki dla nieznanych przełączników: src={src}, dst={dst}")
+        # Potrzebny dostęp do loggera, jeśli chcemy logować w tej funkcji,
+        # lub przekazanie loggera jako argument. Na razie zwracamy None.
+        print(f"Ostrzeżenie: Próba obliczenia ścieżki dla nieznanych przełączników: src={src}, dst={dst}")
+        return None
+
     distance = {node: float('inf') for node in switches}
     previous = {node: None for node in switches}
-    distance[src] = 0       # Odległość do węzła źródłowego wynosi 0
-    Q = set(switches)    # Zbiór węzłów do przetworzenia
-    
+    distance[src] = 0
+    Q = set(switches)
+
     while Q:
         u = minimum_distance(distance, Q)
         if u is None:
-            break  # Graf niespójny
+            # Sytuacja, gdy graf jest niespójny lub nie ma więcej osiągalnych węzłów
+            break
         Q.remove(u)
-        
-        for v in switches:
-            if adjacency[u][v]["port"] is not None:
+
+        # Iterujemy tylko po znanych sąsiadach 'u'
+        for v in adjacency[u]:
+            if adjacency[u][v]["port"] is not None and v in Q: # Sprawdź czy v jest nadal w Q
                 cost = adjacency[u][v]["cost"]
                 alt = distance[u] + cost
                 if alt < distance[v]:
                     distance[v] = alt
                     previous[v] = u
-                    
-    # Odtworzenie ścieżki od węzła docelowego do źródłowego
-    
+
+    # Odtworzenie ścieżki
     path = []
     current = dst
-    while current is not None:
+    # Zabezpieczenie przed nieskończoną pętlą, jeśli ścieżka nie istnieje
+    visited_for_path = set()
+    while current is not None and current not in visited_for_path:
+        visited_for_path.add(current)
         path.insert(0, current)
-        current = previous[current]
-        if current == src:       # Jeśli dotarcie do źródła to koniec
-            path.insert(0, current)
-            break
-    
-    if path[0] != src:
+        if current == src:
+            break # Znaleziono ścieżkę
+        current = previous.get(current) # Użyj .get() dla bezpieczeństwa
+
+    # Sprawdzenie czy ścieżka została poprawnie zbudowana
+    if not path or path[0] != src:
+        print(f"Nie znaleziono ścieżki z {src} do {dst}")
         return None # Brak ścieżki
+
     return path
 
+
 def get_ports(path):
-    # Dodawanie in_port i out_port do ścieżki
-    
     ports = []
     for s1, s2 in zip(path[:-1], path[1:]):
+        # Sprawdzenie czy łącze istnieje
+        if s2 not in adjacency[s1] or s1 not in adjacency[s2]:
+            print(f"Błąd: Brak definicji łącza między {s1} a {s2} w adjacency.")
+            return None # Zwróć None, jeśli brakuje łącza
         out_port = adjacency[s1][s2]["port"]
         in_port = adjacency[s2][s1]["port"]
+        if out_port is None or in_port is None:
+            print(f"Błąd: Brak informacji o porcie dla łącza między {s1} a {s2}.")
+            return None # Zwróć None, jeśli brakuje informacji o porcie
         ports.append((s1, in_port, out_port))
+
+    # Sprawdzenie czy udało się zbudować listę portów
+    if len(ports) != len(path) -1:
+        print(f"Błąd: Nie udało się uzyskać portów dla całej ścieżki {path}.")
+        return None # Błąd w budowaniu portów
+
+    # Dodanie ostatniego segmentu - port wyjściowy na hoście docelowym (nieznany)
+    # Zakładamy, że ostatni element path to przełącznik, do którego podłączony jest host
+    # i że port wyjściowy zostanie określony przez logikę L2 (mac_to_port)
+    # Dla routingu między przełącznikami, możemy zwrócić tylko porty między nimi
     return ports
 
-def calculate_flow_id(packet, in_port, eth_src, eth_dst):
-    # Obliczanie ID przepływu na podstawie 5-krotki
-    ip_proto = 0
-    src_port = 0
-    dst_port = 0
-    
-    try:
-        # próba wydobycia informacji IP
-        ip_header = packet.get_protocol('ipv4') or packet.get_protocol('ipv6')
-        if ip_header:
-            ip_proto = ip_header.proto
-            # wydobycie informacji TCP/UDP
-            tcp_header = packet.get_protocol('tcp')
-            udp_header = packet.get_protocol('udp')
-
-            if tcp_header:
-                src_port = tcp_header.src_port
-                dst_port = tcp_header.dst_port
-            elif udp_header:
-                src_port = udp_header.src_port
-                dst_port = udp_header.dst_port
-    except Exception as e:
-        print(f"Wyjątek podczas parsowania pakietu: {e}")
-
-    flow_tuple = (eth_src, eth_dst, ip_proto, src_port, dst_port, in_port)
-    flow_id = hashlib.md5(str(flow_tuple).encode('utf-8')).hexdigest()
-    return flow_id
-
+# --- Główna Klasa Kontrolera ---
 class FAMTARController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(FAMTARController, self).__init__(*args, **kwargs)
-        self.datapaths = {}  # Przechowywanie obiektów datapath
-        self.fft_lock = threading.Lock() # Zamek do synchronizacji dostępu do FFT        
-        self.thread = None
-
+        self.datapaths = {}
+        self.fft_lock = threading.Lock()
+        self.mac_to_port = {} # <<<--- DODANE: Słownik do nauki MAC -> Port (standard w Ryu)
 
     def add_flow(self, datapath, match, actions, priority=1, idle_timeout=0, hard_timeout=0):
         ofproto = datapath.ofproto
@@ -131,225 +139,305 @@ class FAMTARController(app_manager.RyuApp):
                                 idle_timeout=idle_timeout, hard_timeout=hard_timeout, priority=priority, instructions=inst)
         datapath.send_msg(mod)
 
-    def install_path(self, path, flow_id, ev, src_mac, dst_mac):
-        # Instalacja przepływów na ścieżce
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+    def install_path(self, path_ports, flow_id, ev, src_mac, dst_mac, final_out_port):
+        # path_ports to lista tupli (dpid, in_port, out_port) dla przełączników na ścieżce
 
-        for sw, in_port, out_port in path:
+        if not path_ports:
+            self.logger.error(f"Błąd: Pusta lista portów ścieżki dla flow_id={flow_id}")
+            return
+
+        for i, (sw, in_port, out_port) in enumerate(path_ports):
+            if sw not in self.datapaths:
+                self.logger.error(f"Błąd: Brak obiektu datapath dla przełącznika {sw} w ścieżce.")
+                continue # Pomiń ten przełącznik, ale kontynuuj dla reszty
+
             datapath = self.datapaths[sw]
             ofproto = datapath.ofproto
             parser = datapath.ofproto_parser
 
             match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
             actions = [parser.OFPActionOutput(out_port)]
-            self.add_flow(datapath, match, actions, idle_timeout=IDLE_TIMEOUT, hard_timeout=0)  # Ustawienie IDLE_TIMEOUT
-            self.logger.info(f"Instalacja przepływu: switch={sw}, in_port={in_port}, out_port={out_port}, flow_id={flow_id}, timeout={IDLE_TIMEOUT}")
 
-        with self.fft_lock: # Zabezpieczenie dostępu do FFT
-            fft[flow_id] = (path[-1][2], time.time())  # Zapisanie portu i czasu
-            self.logger.debug(f"Dodano do FFT: flow_id={flow_id}, out_port={path[-1][2]}, timestamp={fft[flow_id][1]}")
+            # Ustawienie idle_timeout, żeby przepływy wygasały
+            self.add_flow(datapath, match, actions, idle_timeout=IDLE_TIMEOUT, hard_timeout=0)
+            self.logger.info(f"Instalacja przepływu: switch={sw}, in_port={in_port}, out_port={out_port}, flow_id={flow_id}")
+
+        # Instalacja przepływu na ostatnim przełączniku kierującego do hosta
+        last_switch_dpid = path_ports[-1][0] # DPID ostatniego przełącznika *przed* hoście docelowym
+        last_switch_in_port = path_ports[-1][1] # Port wejściowy na ostatnim przełączniku
+        if last_switch_dpid in self.datapaths:
+            datapath = self.datapaths[last_switch_dpid]
+            ofproto = datapath.ofproto
+            parser = datapath.ofproto_parser
+            match = parser.OFPMatch(in_port=last_switch_in_port, eth_src=src_mac, eth_dst=dst_mac)
+            actions = [parser.OFPActionOutput(final_out_port)] # Używamy portu wyjściowego do hosta
+            self.add_flow(datapath, match, actions, idle_timeout=IDLE_TIMEOUT, hard_timeout=0)
+            self.logger.info(f"Instalacja przepływu do hosta: switch={last_switch_dpid}, in_port={last_switch_in_port}, out_port={final_out_port}, flow_id={flow_id}")
+        else:
+            self.logger.error(f"Błąd: Brak obiektu datapath dla ostatniego przełącznika {last_switch_dpid} w ścieżce.")
 
 
+        with self.fft_lock:
+            # W FFT zapisujemy port wyjściowy *pierwszego* przełącznika na ścieżce
+            first_switch_out_port = path_ports[0][2]
+            fft[flow_id] = (first_switch_out_port, time.time())
+            self.logger.debug(f"Dodano/zaktualizowano FFT: flow_id={flow_id}, out_port={first_switch_out_port}, timestamp={fft[flow_id][1]}")
+
+    # --- Handlery Eventów ---
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        # Konfiguracja przełącznika
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        dpid = datapath.id
+        self.datapaths[dpid] = datapath
+        self.mac_to_port.setdefault(dpid, {}) # Inicjalizuj słownik portów dla nowego przełącznika
 
-        self.datapaths[datapath.id] = datapath  # Zapisanie obiektu datapath
+        # Dodanie do globalnej listy, jeśli jeszcze go tam nie ma
+        if dpid not in switches:
+            switches.append(dpid)
+            self.logger.info(f"Dodano przełącznik {dpid} do listy znanych przełączników.")
 
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, match, actions, priority=0) #Przechwytywanie wszystkich pakietów do kontrolera
+        self.add_flow(datapath, match, actions, priority=0) # Default flow: send to controller
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        # Obsługa przychodzących pakietów
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
+        dpid = datapath.id
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            return  # Ignorowanie LLDP
+            return # Ignoruj LLDP
 
         dst_mac = eth.dst
         src_mac = eth.src
-        dpid = datapath.id
 
+        # --- Nauka MAC -> Port i MAC -> DPID ---
+        self.mac_to_port.setdefault(dpid, {})
+        # Naucz się, że src_mac jest na porcie in_port przełącznika dpid
+        if self.mac_to_port[dpid].get(src_mac) != in_port:
+            self.logger.info(f"Nauczono MAC->Port: Switch {dpid}, MAC {src_mac}, Port {in_port}")
+            self.mac_to_port[dpid][src_mac] = in_port
+
+        # Naucz się, do którego przełącznika (DPID) podłączony jest src_mac
+        if mac_to_dpid.get(src_mac) != dpid:
+            mac_to_dpid[src_mac] = dpid
+            self.logger.info(f"Nauczono MAC->DPID: MAC {src_mac} -> DPID {dpid}")
+        # --- Koniec nauki ---
+
+        # Oblicz ID przepływu
         flow_id = calculate_flow_id(pkt, in_port, src_mac, dst_mac)
 
+        # Sprawdź FFT
         with self.fft_lock:
             if flow_id in fft:
-                # Przepływ znany - aktualizacja znacznika czasu
-                out_port, timestamp = fft[flow_id] # Rozpakowanie tupli
-                fft[flow_id] = (out_port, time.time()) # Aktualizacja znacznika czasu
-                self.logger.debug(f"Przepływ znaleziony w FFT: flow_id={flow_id}, out_port={out_port}, timestamp={fft[flow_id][1]}")
-                actions = [parser.OFPActionOutput(out_port)]
-                data = None
-                if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-                    data = msg.data
-                out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                        in_port=in_port, actions=actions, data=data)
-                datapath.send_msg(out)
-                return
+                out_port, timestamp = fft[flow_id]
+                # Sprawdź, czy wpis FFT nie wygasł (dodatkowe zabezpieczenie)
+                if time.time() - timestamp <= FFT_IDLE_TIMEOUT:
+                    fft[flow_id] = (out_port, time.time()) # Odśwież timestamp
+                    self.logger.debug(f"Przepływ znaleziony w FFT: flow_id={flow_id}, out_port={out_port}")
+                    actions = [parser.OFPActionOutput(out_port)]
+                    data = None
+                    if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                        data = msg.data
+                    out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                            in_port=in_port, actions=actions, data=data)
+                    datapath.send_msg(out)
+                    return
+                else:
+                    # Wpis wygasł, usuń go z FFT
+                    del fft[flow_id]
+                    self.logger.info(f"Usunięto przestarzały wpis z FFT (timeout): flow_id={flow_id}")
 
-        # Przepływ nieznany - oblicz ścieżkę i zainstaluj przepływy
-        path = calculate_path(dpid, 10) #Przykładowy dst id = 10. Zastąp to adresem MAC, adresem IP lub innym identyfikatorem
 
-        if path:
-            ports = get_ports(path)
-            self.install_path(ports, flow_id, ev, src_mac, dst_mac)
-
-            # Wyślij pakiet
-            out_port = ports[0][2]
+        # Przepływ nieznany LUB wpis FFT wygasł - określ port wyjściowy
+        if dst_mac in self.mac_to_port[dpid]:
+            # Cel jest podłączony do TEGO SAMEGO przełącznika
+            out_port = self.mac_to_port[dpid][dst_mac]
+            self.logger.info(f"Cel {dst_mac} na tym samym przełączniku {dpid}, port {out_port}")
             actions = [parser.OFPActionOutput(out_port)]
-            data = None
-            if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-                data = msg.data
-            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                    in_port=in_port, actions=actions, data=data)
-            datapath.send_msg(out)
-            self.logger.info(f"Nowy przepływ: flow_id={flow_id}, path={path}, out_port={out_port}")
-        else:
-            # Brak ścieżki - zalej
-            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-            data = None
-            if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-                data = msg.data
-            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                    in_port=in_port, actions=actions, data=data)
-            datapath.send_msg(out)
-            self.logger.warning("Brak ścieżki, zalewanie")
+            # Zainstaluj przepływ dla tego przypadku
+            match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
+            self.add_flow(datapath, match, actions, idle_timeout=IDLE_TIMEOUT, hard_timeout=0)
+            # Zapisz w FFT (port wyjściowy tego przełącznika)
+            with self.fft_lock:
+                fft[flow_id] = (out_port, time.time())
+                self.logger.debug(f"Dodano do FFT (ten sam switch): flow_id={flow_id}, out_port={out_port}")
 
+        elif dst_mac in mac_to_dpid:
+            # Cel jest podłączony do INNEGO znanego przełącznika
+            dst_dpid = mac_to_dpid[dst_mac]
+            self.logger.info(f"Cel {dst_mac} na znanym przełączniku {dst_dpid}. Obliczanie ścieżki z {dpid}...")
+            path = calculate_path(dpid, dst_dpid)
+
+            if path:
+                self.logger.info(f"Znaleziono ścieżkę: {path}")
+                path_ports = get_ports(path)
+
+                # Potrzebujemy znać port wyjściowy na ostatnim przełączniku (dst_dpid) do hosta docelowego
+                final_out_port = self.mac_to_port.get(dst_dpid, {}).get(dst_mac)
+
+                if path_ports is not None and final_out_port is not None:
+                    self.logger.info(f"Porty ścieżki: {path_ports}, port do hosta na {dst_dpid}: {final_out_port}")
+                    self.install_path(path_ports, flow_id, ev, src_mac, dst_mac, final_out_port)
+                    # Akcja dla pierwszego pakietu - wyślij na pierwszy port ścieżki
+                    out_port = path_ports[0][2] # Port wyjściowy pierwszego przełącznika
+                    actions = [parser.OFPActionOutput(out_port)]
+                 else:
+                    self.logger.warning(f"Nie udało się uzyskać portów dla ścieżki lub portu do hosta {dst_mac} na {dst_dpid}. Zalewanie.")
+                    actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+                    path = None # Traktuj jakby ścieżki nie było
+            else:
+                self.logger.warning(f"Nie znaleziono ścieżki z {dpid} do {dst_dpid}. Zalewanie.")
+                actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        else:
+            # Cel jest nieznany (nie ma go w mac_to_dpid) -> Zalewanie
+            self.logger.warning(f"Nieznany MAC docelowy: {dst_mac}. Zalewanie z przełącznika {dpid}.")
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+            path = None # Na pewno nie ma ścieżki
+
+        # Wyślij pierwszy pakiet (lub zalej)
+        data = None
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+            data = msg.data
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                in_port=in_port, actions=actions, data=data)
+        datapath.send_msg(out)
+
+    # --- Pozostałe Handlery Eventów (bez zmian) ---
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
-        # Dodanie przełącznika do topologii
         switch = ev.switch
-        switches.append(switch.dp.id)
-        self.logger.info(f"Przełącznik dodany: {switch.dp.id}")
+        dpid = switch.dp.id
+        if dpid not in switches:
+            switches.append(dpid)
+            self.datapaths[dpid] = switch.dp # Zapisz datapath przy wejściu
+            self.mac_to_port.setdefault(dpid, {}) # Inicjalizuj mac_to_port
+            self.logger.info(f"Przełącznik dodany: {dpid}")
+        else:
+            self.logger.warning(f"Przełącznik {dpid} już istnieje na liście.")
+
 
     @set_ev_cls(event.EventSwitchLeave)
     def switch_leave_handler(self, ev):
-        # Usunięcie przełącznika z topologii
         switch = ev.switch
-        switches.remove(switch.dp.id)
-        self.logger.info(f"Przełącznik usunięty: {switch.dp.id}")
+        dpid = switch.dp.id
+        if dpid in switches:
+            switches.remove(dpid)
+            self.logger.info(f"Przełącznik usunięty: {dpid}")
+        if dpid in self.datapaths:
+            del self.datapaths[dpid]
+        if dpid in self.mac_to_port:
+            del self.mac_to_port[dpid]
+        # Opcjonalnie: Usuń wpisy z mac_to_dpid, jeśli hosty były podłączone tylko do tego przełącznika
+        keys_to_remove = [mac for mac, dp in mac_to_dpid.items() if dp == dpid]
+        for key in keys_to_remove:
+            del mac_to_dpid[key]
+            self.logger.info(f"Usunięto mapowanie MAC->DPID dla {key} (przełącznik {dpid} odszedł)")
+
 
     @set_ev_cls(event.EventLinkAdd)
     def link_add_handler(self, ev):
-        # Dodanie łącza do topologii
         link = ev.link
         src_dpid = link.src.dpid
         dst_dpid = link.dst.dpid
         src_port = link.src.port_no
         dst_port = link.dst.port_no
 
-        adjacency[src_dpid][dst_dpid]["port"] = src_port
-        adjacency[dst_dpid][src_dpid]["port"] = dst_port
-        adjacency[src_dpid][dst_dpid]["cost"] = DEFAULT_COST
-        adjacency[dst_dpid][src_dpid]["cost"] = DEFAULT_COST
+        # Upewnij się, że oba przełączniki są na liście 'switches'
+        if src_dpid in switches and dst_dpid in switches:
+            adjacency[src_dpid][dst_dpid]["port"] = src_port
+            adjacency[dst_dpid][src_dpid]["port"] = dst_port
+            # Resetuj koszt przy dodaniu łącza
+            adjacency[src_dpid][dst_dpid]["cost"] = DEFAULT_COST
+            adjacency[dst_dpid][src_dpid]["cost"] = DEFAULT_COST
+            self.logger.info(f"Łącze dodane: {src_dpid}:{src_port} <-> {dst_dpid}:{dst_port}")
+        else:
+            self.logger.warning(f"Ignorowanie dodania łącza między {src_dpid} a {dst_dpid} - jeden lub oba przełączniki nie są znane.")
 
-        self.logger.info(f"Łącze dodane: {src_dpid}:{src_port} <-> {dst_dpid}:{dst_port}")
 
     @set_ev_cls(event.EventLinkDelete)
     def link_delete_handler(self, ev):
-        # Usunięcie łącza z topologii
         link = ev.link
         src_dpid = link.src.dpid
         dst_dpid = link.dst.dpid
+        # Usuń wpisy adjacency w obie strony
+        if src_dpid in adjacency and dst_dpid in adjacency[src_dpid]:
+            del adjacency[src_dpid][dst_dpid]
+        if dst_dpid in adjacency and src_dpid in adjacency[dst_dpid]:
+            del adjacency[dst_dpid][src_dpid]
+        self.logger.info(f"Łącze usunięte między: {src_dpid} <-> {dst_dpid}")
 
-        adjacency[src_dpid][dst_dpid]["port"] = None
-        adjacency[dst_dpid][src_dpid]["port"] = None
-
-        self.logger.info(f"Łącze usunięte: {src_dpid} <-> {dst_dpid}")
-
-    #Implementacja monitorowania łącza (wysyłanie zapytań o statystyki)
+    # --- Monitorowanie i Czyszczenie (z poprawkami) ---
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
         body = ev.msg.body
         datapath = ev.msg.datapath
+        dpid = datapath.id
 
+        # Aktualizacja statystyk obciążenia (prostsza wersja, można rozbudować)
+        # TODO: Dokładniejsze mapowanie statystyk przepływów na obciążenie konkretnych *łączy*
+        #       Obecny kod jest uproszczony i może nie odzwierciedlać dokładnie obciążenia per-link.
         for stat in sorted([flow for flow in body if flow.priority == 1],
-                        key=lambda flow: (flow.match['in_port'], flow.match['eth_dst'])): #Sortowanie statystyk
-            src_port = stat.match['in_port']
-            dst_mac = stat.match['eth_dst']
+                        key=lambda flow: (flow.match.get('in_port', 0), flow.match.get('eth_dst', ''))): # Użyj .get dla bezpieczeństwa
+            # Ta część wymagałaby bardziej zaawansowanej logiki, aby powiązać
+            # przepływ ze specyficznym łączem wyjściowym i zaktualizować jego koszt.
+            # Na razie pomijamy dynamiczną aktualizację kosztów na podstawie statystyk.
+            pass
 
-            # Znajdź port wyjściowy w topologii (jeśli istnieje)
-            dst_port = None
-            for sw in switches:
-                if adjacency[datapath.id][sw]["port"] is not None:
-                    dst_port = adjacency[datapath.id][sw]["port"]
+        # self.logger.debug(f"Otrzymano statystyki przepływów z {dpid}")
 
-            if dst_port is None:
-                continue #Nie znaleziono portu docelowego
 
-            link = (datapath.id, dst_port) # Identyfikacja łącza
-            current_time = time.time()
-            tx_bytes = stat.byte_count
-
-            #Obliczanie obciążenia łącza
-            if link in link_load:
-                old_tx_bytes = link_load[link]["tx_bytes"]
-                old_timestamp = link_load[link]["timestamp"]
-                duration = current_time - old_timestamp
-                if duration > 0:
-                    load = (tx_bytes - old_tx_bytes) * 8 / duration  # Obciążenie w bitach/s
-                    capacity = 1000000000 #Przykladowa przepustowosc 1Gbps.  Zmień na rzeczywistą pojemność łącza
-
-                    #Aktualizacja kosztów łączy
-                    if load > TRESHOLD_HIGH * capacity and adjacency[datapath.id][dst_port]["cost"] != MAX_COST:
-                        adjacency[datapath.id][dst_port]["cost"] = MAX_COST
-                        self.logger.warning(f"Łącze {datapath.id}->{dst_port} obciążone. Zmiana kosztu na {MAX_COST}")
-                    elif load < TRESHOLD_LOW * capacity and adjacency[datapath.id][dst_port]["cost"] == MAX_COST:
-                        adjacency[datapath.id][dst_port]["cost"] = DEFAULT_COST
-                        self.logger.info(f"Łącze {datapath.id}->{dst_port} zwolnione.  Przywrócenie kosztu do {DEFAULT_COST}")
-                else:
-                    load = 0
-
-            # Aktualizacja informacji o łącze
-            link_load[link]["tx_bytes"] = tx_bytes
-            link_load[link]["timestamp"] = current_time
-
-        # Wysłanie żądania o statystyki ponownie
-        self._request_stats()
-
-    #Żądanie statystyk przepływów
-    def _request_stats(self):
+    def _request_stats_loop(self):
         """Pętla wysyłająca cyklicznie żądania statystyk przepływów."""
-        for datapath in self.datapaths.values():
-            ofproto = datapath.ofproto
-            parser = datapath.ofproto_parser
-            req = parser.OFPFlowStatsRequest(datapath)
-            datapath.send_msg(req)
-            
-    # Funkcja czyszcząca FFT
-    def _cleanup_fft(self):
-        """Czyszczenie przestarzałych wpisów w FFT."""
+        while True:
+            # self.logger.debug("Rozpoczynanie cyklu żądań statystyk...")
+            # Tworzymy kopię kluczy, aby uniknąć błędów przy modyfikacji słownika w innym wątku
+            datapaths_to_request = list(self.datapaths.keys())
+            for dpid in datapaths_to_request:
+                if dpid in self.datapaths: # Sprawdź, czy datapath nadal istnieje
+                    datapath = self.datapaths[dpid]
+                    ofproto = datapath.ofproto
+                    parser = datapath.ofproto_parser
+                    req = parser.OFPFlowStatsRequest(datapath)
+                    try:
+                        datapath.send_msg(req)
+                        # self.logger.debug(f"Wysłano żądanie statystyk do {dpid}")
+                    except Exception as e:
+                        self.logger.error(f"Błąd podczas wysyłania żądania statystyk do {dpid}: {e}")
+                else:
+                    self.logger.warning(f"Próba wysłania statystyk do nieistniejącego datapath {dpid}")
+
+            time.sleep(STATS_REQUEST_INTERVAL)
+
+    def _cleanup_fft_loop(self):
+        """Pętla czyszcząca przestarzałe wpisy w FFT."""
         while True:
             time.sleep(CLEANUP_INTERVAL)
             with self.fft_lock:
                 current_time = time.time()
                 expired_flows = [flow_id for flow_id, (out_port, timestamp) in fft.items()
-                                if current_time - timestamp > IDLE_TIMEOUT] # Lista przestarzałych przepływów
-                for flow_id in expired_flows:
-                    del fft[flow_id]
-                    self.logger.info(f"Usunięto przestarzały wpis z FFT: flow_id={flow_id}")
-                self.logger.debug(f"FFT po czyszczeniu: {fft}")
+                                if current_time - timestamp > FFT_IDLE_TIMEOUT]
+                if expired_flows:
+                    self.logger.info(f"Czyszczenie FFT: Usuwanie {len(expired_flows)} przestarzałych wpisów.")
+                    for flow_id in expired_flows:
+                        del fft[flow_id]
+                        # self.logger.debug(f"Usunięto przestarzały wpis z FFT: flow_id={flow_id}")
+                # else:
+                #      self.logger.debug("Czyszczenie FFT: Brak przestarzałych wpisów.")
 
-    # Uruchomienie monitoringu po starcie aplikacji
+
     def start(self):
         super(FAMTARController, self).start()
-        self.logger.info("FAMTAR Controller uruchomiony")
-        self.monitor_thread = threading.Thread(target = self._request_stats) #Uruchomienie monitoringu
-        self.cleanup_thread = threading.Thread(target=self._cleanup_fft) # Uruchomienie czyszczenia FFT
-        self.monitor_thread.start()
-        self.cleanup_thread.start()
+        # Używamy self.spawn do uruchamiania wątków w tle zarządzanych przez Ryu
+        self.monitor_thread = self.spawn(self._request_stats_loop)
+        self.cleanup_thread = self.spawn(self._cleanup_fft_loop)
+        self.logger.info("FAMTAR Controller uruchomiony. Wątki monitoringu i czyszczenia FFT aktywne.")
