@@ -438,6 +438,6 @@ class FAMTARController(app_manager.RyuApp):
     def start(self):
         super(FAMTARController, self).start()
         # Używamy self.spawn do uruchamiania wątków w tle zarządzanych przez Ryu
-        self.monitor_thread = self.spawn(self._request_stats_loop)
-        self.cleanup_thread = self.spawn(self._cleanup_fft_loop)
+        self.monitor_thread = threading.Thread(self._request_stats_loop)
+        self.cleanup_thread = threading.Thread(self._cleanup_fft_loop)
         self.logger.info("FAMTAR Controller uruchomiony. Wątki monitoringu i czyszczenia FFT aktywne.")
