@@ -379,3 +379,13 @@ class FAMTARController(app_manager.RyuApp):
         self.cleanup_thread = threading.Thread(target=self._cleanup_fft) # Uruchomienie czyszczenia FFT
         self.monitor_thread.start()
         self.cleanup_thread.start()
+        
+            # Force default flow rule if switch_features_handler missed
+        time.sleep(1)  # Poczekaj na połączenia
+        for dp in self.datapaths.values():
+            self.logger.info(f"Force adding default flow to switch {dp.id}")
+            ofproto = dp.ofproto
+            parser = dp.ofproto_parser
+            match = parser.OFPMatch()
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+            self.add_flow(dp, match, actions, priority=0)
