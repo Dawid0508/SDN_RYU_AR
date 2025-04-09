@@ -435,9 +435,11 @@ class FAMTARController(app_manager.RyuApp):
                 #      self.logger.debug("Czyszczenie FFT: Brak przestarzałych wpisów.")
 
 
+# Uruchomienie monitoringu po starcie aplikacji
     def start(self):
-        super(FAMTARController, self).start()
-        # Używamy self.spawn do uruchamiania wątków w tle zarządzanych przez Ryu
-        self.monitor_thread = threading.Thread(self._request_stats_loop)
-        self.cleanup_thread = threading.Thread(self._cleanup_fft_loop)
-        self.logger.info("FAMTAR Controller uruchomiony. Wątki monitoringu i czyszczenia FFT aktywne.")
+        super(FAMTARController, self).start() # Ważne: wywołanie start() z klasy nadrzędnej
+        self.logger.info("FAMTAR Controller uruchomiony")
+        # Uzywamy self.spawn do uruchamiania watkow w tle zarzadzanych przez Ryu
+        self.monitor_thread = self.spawn(self._request_stats_loop) # Użyj self.spawn
+        self.cleanup_thread = self.spawn(self._cleanup_fft_loop) # Użyj self.spawn
+        self.logger.info("Watki monitoringu i czyszczenia FFT uruchomione przez spawn.")
