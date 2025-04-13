@@ -523,18 +523,18 @@ class FAMTARController(app_manager.RyuApp):
             # Tworzymy kopię kluczy, aby uniknąć błędów przy modyfikacji słownika w innym wątku
             datapaths_to_request = list(self.datapaths.keys())
             for dpid in datapaths_to_request:
-                 if dpid in self.datapaths: # Sprawdź, czy datapath nadal istnieje
-                     datapath = self.datapaths[dpid]
-                     ofproto = datapath.ofproto
-                     parser = datapath.ofproto_parser
-                     req = parser.OFPFlowStatsRequest(datapath)
-                     try:
-                         datapath.send_msg(req)
-                         # self.logger.debug(f"Wysłano żądanie statystyk do {dpid}")
-                     except Exception as e:
-                          self.logger.error(f"Błąd podczas wysyłania żądania statystyk do {dpid}: {e}")
-                 else:
-                      self.logger.warning(f"Próba wysłania statystyk do nieistniejącego datapath {dpid}")
+                if dpid in self.datapaths: # Sprawdź, czy datapath nadal istnieje
+                    datapath = self.datapaths[dpid]
+                    ofproto = datapath.ofproto
+                    parser = datapath.ofproto_parser
+                    req = parser.OFPFlowStatsRequest(datapath)
+                    try:
+                        datapath.send_msg(req)
+                        # self.logger.debug(f"Wysłano żądanie statystyk do {dpid}")
+                    except Exception as e:
+                        self.logger.error(f"Błąd podczas wysyłania żądania statystyk do {dpid}: {e}")
+                else:
+                    self.logger.warning(f"Próba wysłania statystyk do nieistniejącego datapath {dpid}")
 
             time.sleep(STATS_REQUEST_INTERVAL)
 
@@ -545,11 +545,11 @@ class FAMTARController(app_manager.RyuApp):
             with self.fft_lock:
                 current_time = time.time()
                 expired_flows = [flow_id for flow_id, (out_port, timestamp) in fft.items()
-                                 if current_time - timestamp > FFT_IDLE_TIMEOUT]
+                                if current_time - timestamp > FFT_IDLE_TIMEOUT]
                 if expired_flows:
-                     self.logger.info(f"Czyszczenie FFT: Usuwanie {len(expired_flows)} przestarzałych wpisów.")
-                     for flow_id in expired_flows:
-                         del fft[flow_id]
+                    self.logger.info(f"Czyszczenie FFT: Usuwanie {len(expired_flows)} przestarzałych wpisów.")
+                    for flow_id in expired_flows:
+                        del fft[flow_id]
                          # self.logger.debug(f"Usunięto przestarzały wpis z FFT: flow_id={flow_id}")
                 # else:
                 #      self.logger.debug("Czyszczenie FFT: Brak przestarzałych wpisów.")
