@@ -246,8 +246,6 @@ class FAMTARController(app_manager.RyuApp):
                 # Ta logika jest już w packet_in_handler, więc tu nie powinna być potrzebna, ale zostawmy ostrzeżenie
                 if len(path) != 1:
                     self.logger.warning("    Nie udalo sie ustalic portu dla pierwszego kroku do aktualizacji FFT.")
-
-
         self.logger.info(f"--- Zakonczono instalacje sciezki dla flow_id: {flow_id} ---")
     # --- Handlery Eventów ---
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -315,7 +313,7 @@ class FAMTARController(app_manager.RyuApp):
                     data = None
                     if msg.buffer_id == ofproto.OFP_NO_BUFFER:
                         data = msg.data
-                    out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                    out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
                                             in_port=in_port, actions=actions, data=data)
                     datapath.send_msg(out)
                     self.logger.info(f"--- Zakonczono obsluge PacketIn (FFT hit) ---")
@@ -388,7 +386,7 @@ class FAMTARController(app_manager.RyuApp):
             data = None
             if msg.buffer_id == ofproto.OFP_NO_BUFFER:
                 data = msg.data
-            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+            out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
                                     in_port=in_port, actions=actions, data=data)
             datapath.send_msg(out)
             self.logger.info(f"    Wyslano PacketOut.")
