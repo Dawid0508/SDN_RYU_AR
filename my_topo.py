@@ -56,7 +56,18 @@ def myNetwork():
     net.addLink(s4, s5, **link_opts_sw)
 
     info( '*** Starting network\n')
-    net.start()
+    net.build()
+    
+    info( '*** Starting controllers\n')
+    c0.start()
+    
+    info( '*** Starting switches\n')
+    net.get('s1').start([c0])
+    net.get('s2').start([c0])
+    net.get('s3').start([c0])
+    net.get('s4').start([c0])
+    net.get('s5').start([c0])
+    #net.start()
 
     info( '*** Post configure switches and hosts\n')
 
