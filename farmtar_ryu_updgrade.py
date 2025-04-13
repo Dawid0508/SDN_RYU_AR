@@ -172,19 +172,25 @@ class FAMTARController(app_manager.RyuApp):
                                 idle_timeout=idle_timeout, hard_timeout=hard_timeout, priority=priority, instructions=inst)
         datapath.send_msg(mod)
 
-    def install_path(self, path, path_ports, flow_id, ev, src_mac, dst_mac, final_out_port):
+    # Zmieniona definicja, dodano original_in_port
+    def install_path(self, path, flow_id, ev, src_mac, dst_mac, final_out_port, original_in_port):
         # path: lista DPID [dpid_src, dpid_mid1, ..., dpid_dst]
-        # path_ports: lista tupli [(dpid_mid1, in_port_mid1, out_port_src), (dpid_mid2, in_port_mid2, out_port_mid1), ...]
         # final_out_port: port na ostatnim dpid (dpid_dst) do hosta
+        # original_in_port: port, na który pakiet wszedł na PIERWSZYM dpid (path[0])
         self.logger.info(f"--- Rozpoczynam instalacje sciezki dla flow_id: {flow_id} ---")
         self.logger.info(f"    Sciezka DPID: {path}")
-        self.logger.info(f"    Porty miedzy switchami: {path_ports}")
         self.logger.info(f"    Port koncowy na {path[-1]} do hosta: {final_out_port}")
+        self.logger.info(f"    Port wejsciowy na {path[0]}: {original_in_port}")
 
-        # Instalacja przepływów na przełącznikach pośrednich i pierwszym
-        for i in range(len(path) - 1): # Iterujemy po parach przełączników na ścieżce
+        if not path:
+            self.logger.error("    Blad: Pusta sciezka DPID.")
+            return
+
+        first_switch_out_port = None # Do zapisu w FFT
+
+        # Iteracja przez wszystkie przełączniki na ścieżce
+        for i in range(len(path)):
             current_dpid = path[i]
-            next_dpid = path[i+1]
 
             if current_dpid not in self.datapaths:
                 self.logger.error(f"    Blad: Brak datapath dla przełącznika {current_dpid}.")
@@ -193,97 +199,56 @@ class FAMTARController(app_manager.RyuApp):
             datapath = self.datapaths[current_dpid]
             parser = datapath.ofproto_parser
 
-            # Znajdź port wyjściowy z current_dpid do next_dpid
-            out_port = adjacency[current_dpid][next_dpid].get("port")
-            if out_port is None:
-                self.logger.error(f"    Blad: Nie znaleziono portu wyjsciowego z {current_dpid} do {next_dpid} w adjacency.")
-                continue
-
-            # Port wejściowy - dla pierwszego przełącznika to port, z którego przyszedł pakiet (znany z PacketIn)
-            # Dla kolejnych to port, którym pakiet przyszedł z poprzedniego przełącznika
+            # Określ port wejściowy (match_in_port)
             if i == 0:
-                # Specjalny przypadek dla pierwszego przełącznika - in_port znamy z PacketIn msg
-                # Musimy go przekazać do tej funkcji lub pobrać z kontekstu eventu
-                # Na razie zakładamy, że go mamy (np. przekazany jako argument dodatkowy)
-                # W obecnym kodzie packet_in_handler go nie przekazuje - to TRZEBA POPRAWIĆ
-                # Załóżmy na chwilę, że in_port na pierwszym switchu jest znany
-                # msg = ev.msg # Pobranie wiadomości z eventu
-                # match_in_port = msg.match['in_port'] # Port wejściowy na PIERWSZYM switchu
-                # Zamiast tego, użyjemy informacji z path_ports, jeśli jest dostępna dla pierwszego kroku
-                 # Potrzebujemy in_port na *pierwszym* dpid. get_ports tego nie zwraca.
-                # Musimy to przekazać z packet_in_handler.
-
-                # ===>>> WAŻNA POPRAWKA W packet_in_handler POTRZEBNA <<<===
-                # Należy przekazać oryginalny `in_port` z wiadomości PacketIn
-                # do funkcji `install_path`, np.:
-                # self.install_path(path, path_ports, flow_id, ev, src_mac, dst_mac, final_out_port, msg.match['in_port'])
-                # I dodać parametr `original_in_port` do definicji install_path.
-
-                # Na razie symulujemy - to MUSI być naprawione
-                self.logger.warning("    Symulacja: Brak oryginalnego in_port dla pierwszego switcha w install_path!")
-                continue # Pomińmy instalację na pierwszym switchu na razie
-
+                match_in_port = original_in_port # Użyj przekazanego portu dla pierwszego switcha
             else:
-                # Dla przełączników pośrednich, in_port to port, którym przyszedł z poprzedniego
-                # Znajdź port wejściowy na current_dpid z path[i-1]
                 prev_dpid = path[i-1]
-                match_in_port = adjacency[current_dpid][prev_dpid].get("port")
+                match_in_port = adjacency[current_dpid].get(prev_dpid, {}).get("port")
                 if match_in_port is None:
-                    self.logger.error(f"    Blad: Nie znaleziono portu wejsciowego na {current_dpid} z {prev_dpid} w adjacency.")
+                    self.logger.error(f"    Blad: Nie znaleziono portu wejsciowego na {current_dpid} z {prev_dpid}.")
                     continue
 
+            # Określ port wyjściowy (out_port)
+            if i < len(path) - 1:
+                next_dpid = path[i+1]
+                out_port = adjacency[current_dpid].get(next_dpid, {}).get("port")
+                if out_port is None:
+                    self.logger.error(f"    Blad: Nie znaleziono portu wyjsciowego z {current_dpid} do {next_dpid}.")
+                    continue
+                if i == 0: # Zapamiętaj dla FFT
+                    first_switch_out_port = out_port
+            else: # Ostatni przełącznik
+                out_port = final_out_port
+                if out_port is None:
+                    self.logger.error(f"    Blad: Brak portu wyjsciowego do hosta na {current_dpid}.")
+                    continue
 
+            # Utwórz match i actions
             match = parser.OFPMatch(in_port=match_in_port, eth_src=src_mac, eth_dst=dst_mac)
             actions = [parser.OFPActionOutput(out_port)]
 
-            self.add_flow(datapath, match, actions, idle_timeout=IDLE_TIMEOUT, hard_timeout=0)
-            self.logger.info(f"    Instalacja (posredni): switch={current_dpid}, in_port={match_in_port}, out_port={out_port}")
+            # Dodaj przepływ
+            self.add_flow(datapath, match, actions, priority=1, idle_timeout=IDLE_TIMEOUT, hard_timeout=0)
+            self.logger.info(f"    Instalacja: switch={current_dpid}, in_port={match_in_port}, out_port={out_port}")
 
-
-        # Instalacja przepływu na OSTATNIM przełączniku (path[-1]) kierującego do hosta
-        last_dpid = path[-1]
-        if last_dpid in self.datapaths:
-            datapath = self.datapaths[last_dpid]
-            parser = datapath.ofproto_parser
-
-            # Port wejściowy na ostatnim przełączniku
-            if len(path) > 1:
-                prev_dpid = path[-2]
-                match_in_port = adjacency[last_dpid][prev_dpid].get("port")
-                if match_in_port is None:
-                    self.logger.error(f"    Blad: Nie znaleziono portu wejsciowego na ostatnim switchu {last_dpid} z {prev_dpid} w adjacency.")
-                    return # Nie można zainstalować ostatniego kroku
-            else:
-                # Sciezka ma tylko jeden element - host podlaczony bezposrednio
-                # Potrzebujemy oryginalnego in_port z packet_in_handler
-                self.logger.error("    Blad: Sciezka ma tylko 1 element, potrzebny oryginalny in_port w install_path.")
-                return # Nie można zainstalować
-
-            match = parser.OFPMatch(in_port=match_in_port, eth_src=src_mac, eth_dst=dst_mac)
-            actions = [parser.OFPActionOutput(final_out_port)] # Używamy portu wyjściowego do hosta
-            self.add_flow(datapath, match, actions, idle_timeout=IDLE_TIMEOUT, hard_timeout=0)
-            self.logger.info(f"    Instalacja (do hosta): switch={last_dpid}, in_port={match_in_port}, out_port={final_out_port}")
-        else:
-            self.logger.error(f"    Blad: Brak obiektu datapath dla ostatniego przełącznika {last_dpid}.")
-
-
-        # Aktualizacja FFT tylko jeśli instalacja się powiodła (przynajmniej częściowo)
+        # Aktualizacja FFT
         with self.fft_lock:
-             # W FFT zapisujemy port wyjściowy *pierwszego* przełącznika na ścieżce
-            if len(path) > 1:
-                first_hop_dpid = path[0]
-                second_hop_dpid = path[1]
-                first_switch_out_port = adjacency[first_hop_dpid][second_hop_dpid].get("port")
-                if first_switch_out_port is not None:
-                    fft[flow_id] = (first_switch_out_port, time.time())
-                    self.logger.debug(f"    Dodano/zaktualizowano FFT: flow_id={flow_id}, out_port={first_switch_out_port}")
-                else:
-                    self.logger.error("    Blad: Nie mozna znalezc portu dla pierwszego kroku do aktualizacji FFT.")
-            elif len(path) == 1 and out_port is not None: # Przypadek hosta na tym samym switchu
+            # Sprawdź, czy udało się ustalić port dla pierwszego kroku
+            if first_switch_out_port is not None:
+                fft[flow_id] = (first_switch_out_port, time.time())
+                self.logger.debug(f"    Dodano/zaktualizowano FFT: flow_id={flow_id}, out_port={first_switch_out_port}")
+            elif len(path) == 1 and out_port is not None: # Obsługa przypadku hosta na tym samym switchu (choć nie powinno tu trafić)
                 fft[flow_id] = (out_port, time.time())
                 self.logger.debug(f"    Dodano/zaktualizowano FFT (ten sam switch): flow_id={flow_id}, out_port={out_port}")
-        self.logger.info(f"--- Zakonczono instalacje sciezki dla flow_id: {flow_id} ---")
+            else:
+                # Sprawdźmy, czy path ma tylko jeden element i out_port jest znany (host na tym samym switchu)
+                # Ta logika jest już w packet_in_handler, więc tu nie powinna być potrzebna, ale zostawmy ostrzeżenie
+                if len(path) != 1:
+                    self.logger.warning("    Nie udalo sie ustalic portu dla pierwszego kroku do aktualizacji FFT.")
 
+
+        self.logger.info(f"--- Zakonczono instalacje sciezki dla flow_id: {flow_id} ---")
     # --- Handlery Eventów ---
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -396,7 +361,7 @@ class FAMTARController(app_manager.RyuApp):
                     # Musimy zmodyfikować install_path, aby przyjmował ten port
                     # self.install_path(path, path_ports, flow_id, ev, src_mac, dst_mac, final_out_port, in_port)
                     # Na razie wywołujemy starą wersję, PAMIĘTAJ O POPRAWCE install_path
-                    self.install_path(path, path_ports, flow_id, ev, src_mac, dst_mac, final_out_port)
+                    self.install_path(path, flow_id, ev, src_mac, dst_mac, final_out_port, in_port) # Dodano in_port
                     # ===>>> Koniec ważnej zmiany <<<===
 
                     # Akcja dla pierwszego pakietu - wyslij na pierwszy port sciezki
@@ -549,7 +514,7 @@ class FAMTARController(app_manager.RyuApp):
                     self.logger.info(f"Czyszczenie FFT: Usuwanie {len(expired_flows)} przestarzałych wpisów.")
                     for flow_id in expired_flows:
                         del fft[flow_id]
-                         # self.logger.debug(f"Usunięto przestarzały wpis z FFT: flow_id={flow_id}")
+                        # self.logger.debug(f"Usunięto przestarzały wpis z FFT: flow_id={flow_id}")
                 # else:
                 #      self.logger.debug("Czyszczenie FFT: Brak przestarzałych wpisów.")
 
