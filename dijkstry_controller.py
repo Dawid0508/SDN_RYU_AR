@@ -119,7 +119,12 @@ class PathfindingController(app_manager.RyuApp):
         else:
             # Cel jest nieznany, zalewamy sieć, żeby go odkryć (głównie dla ARP)
             self.logger.info(f"ROUTE: Cel {dst} jest nieznany. Zalewam sieć (FLOOD).")
-            self.send_packet_out(datapath, msg, [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)], in_port)
+            actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)]
+            # WAŻNA ZMIANA: Ustawiamy buffer_id na NO_BUFFER przy zalewaniu
+            out = datapath.ofproto_parser.OFPPacketOut(
+                datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER, 
+                in_port=in_port, actions=actions, data=msg.data)
+            datapath.send_msg(out)
 
     def send_packet_out(self, datapath, msg, actions, in_port):
         out = datapath.ofproto_parser.OFPPacketOut(
