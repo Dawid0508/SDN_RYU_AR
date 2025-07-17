@@ -21,8 +21,8 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
-from ryu.lib import_link
 from ryu.topology import event, switches
+from ryu.topology.api import get_switch, get_link
 import networkx as nx # <--- Użycie biblioteki networkx do operacji na grafach
 
 class SimpleSwitch13(app_manager.RyuApp):
@@ -82,11 +82,71 @@ class SimpleSwitch13(app_manager.RyuApp):
         links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
         self.net.add_edges_from(links)
 
+    # @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    # def _packet_in_handler(self, ev):
+    #     if ev.msg.msg_len < ev.msg.total_len:
+    #         self.logger.debug("packet truncated: only %s of %s bytes",
+    #                             ev.msg.msg_len, ev.msg.total_len)
+    #     msg = ev.msg
+    #     datapath = msg.datapath
+    #     ofproto = datapath.ofproto
+    #     parser = datapath.ofproto_parser
+    #     in_port = msg.match['in_port']
+
+    #     pkt = packet.Packet(msg.data)
+    #     eth = pkt.get_protocols(ethernet.ethernet)[0]
+
+    #     if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+    #         # ignore lldp packet
+    #         return
+            
+    #     dst = eth.dst
+    #     src = eth.src
+    #     dpid = datapath.id
+    #     self.mac_to_port.setdefault(dpid, {})
+
+    #     # learn a mac address to avoid FLOOD next time.
+    #     self.mac_to_port[dpid][src] = in_port
+
+    #     if dst in self.mac_to_port[dpid]:
+    #         out_port = self.mac_to_port[dpid][dst]
+    #     else:
+    #         out_port = ofproto.OFPP_FLOOD
+
+    #     # <--- KLUCZOWY MOMENT DLA DIJKSTRY I FAMTAR
+    #     if src not in self.net:
+    #         self.net.add_node(src)
+    #         self.net.add_edge(dpid, src, port=in_port)
+    #         self.net.add_edge(src, dpid)
+    #     if dst in self.net:
+    #         # <--- WYWOŁANIE ALGORYTMU DIJKSTRY Z NETWORKX
+    #         # Funkcja shortest_path domyślnie użyje atrybutu 'weight' krawędzi do obliczeń.
+    #         # Jeśli wagi nie są jawnie zdefiniowane, przyjmuje wartość 1.
+    #         path = nx.shortest_path(self.net, src, dst)
+    #         next = path[path.index(dpid) + 1]
+    #         out_port = self.net[dpid][next]['port']
+    #         self.mac_to_port[dpid][dst] = out_port
+
+    #     actions = [parser.OFPActionOutput(out_port)]
+
+    #     # install a flow to avoid packet_in next time
+    #     if out_port != ofproto.OFPP_FLOOD:
+    #         match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
+    #         if msg.buffer_id != ofproto.OFP_NO_BUFFER:
+    #             self.add_flow(datapath, 1, match, actions, msg.buffer_id)
+    #             return
+    #         else:
+    #             self.add_flow(datapath, 1, match, actions)
+                
+    #     data = None
+    #     if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+    #         data = msg.data
+
+    #     out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+    #                                 in_port=in_port, actions=actions, data=data)
+    #     datapath.send_msg(out)
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        if ev.msg.msg_len < ev.msg.total_len:
-            self.logger.debug("packet truncated: only %s of %s bytes",
-                                ev.msg.msg_len, ev.msg.total_len)
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -94,54 +154,54 @@ class SimpleSwitch13(app_manager.RyuApp):
         in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocols(ethernet.ethernet)[0]
+        eth = pkt.get_protocol(ethernet.ethernet)
 
+        # Ignoruj pakiety LLDP (służące do odkrywania topologii)
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            # ignore lldp packet
             return
-            
+
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
-        self.mac_to_port.setdefault(dpid, {})
 
-        # learn a mac address to avoid FLOOD next time.
-        self.mac_to_port[dpid][src] = in_port
-
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
-        else:
-            out_port = ofproto.OFPP_FLOOD
-
-        # <--- KLUCZOWY MOMENT DLA DIJKSTRY I FAMTAR
+        # Naucz się, gdzie jest host źródłowy (MAC)
+        # Dodaj go do grafu, jeśli jeszcze go tam nie ma
         if src not in self.net:
             self.net.add_node(src)
             self.net.add_edge(dpid, src, port=in_port)
             self.net.add_edge(src, dpid)
+
+        # Jeśli adres docelowy jest w grafie, oblicz ścieżkę
         if dst in self.net:
-            # <--- WYWOŁANIE ALGORYTMU DIJKSTRY Z NETWORKX
-            # Funkcja shortest_path domyślnie użyje atrybutu 'weight' krawędzi do obliczeń.
-            # Jeśli wagi nie są jawnie zdefiniowane, przyjmuje wartość 1.
-            path = nx.shortest_path(self.net, src, dst)
-            next = path[path.index(dpid) + 1]
-            out_port = self.net[dpid][next]['port']
-            self.mac_to_port[dpid][dst] = out_port
-
-        actions = [parser.OFPActionOutput(out_port)]
-
-        # install a flow to avoid packet_in next time
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-                return
-            else:
-                self.add_flow(datapath, 1, match, actions)
+            try:
+                # Oblicz ścieżkę za pomocą algorytmu Dijkstry (z wagami)
+                path = nx.shortest_path(self.net, src, dst, weight='weight')
                 
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
+                # Znajdź następny krok w ścieżce i port wyjściowy
+                next_hop = path[path.index(dpid) + 1]
+                out_port = self.net[dpid][next_hop]['port']
 
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                    in_port=in_port, actions=actions, data=data)
-        datapath.send_msg(out)
+                # Zainstaluj regułę przepływu
+                actions = [parser.OFPActionOutput(out_port)]
+                match = parser.OFPMatch(eth_dst=dst, eth_src=src)
+                self.add_flow(datapath, 1, match, actions)
+
+                # Wyślij pakiet
+                out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                          in_port=in_port, actions=actions, data=msg.data)
+                datapath.send_msg(out)
+
+            except nx.NetworkXNoPath:
+                # Jeśli z jakiegoś powodu nie ma ścieżki, zignoruj
+                self.logger.debug(f"Brak ścieżki z {src} do {dst}")
+                return
+        else:
+            # Jeśli nie znamy lokalizacji hosta docelowego, zalej sieć (FLOOD)
+            # To pozwoli pakietom ARP dotrzeć do celu i umożliwi naukę
+            out_port = ofproto.OFPP_FLOOD
+            actions = [parser.OFPActionOutput(out_port)]
+            
+            # Wyślij pakiet
+            out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+                                      in_port=in_port, actions=actions, data=msg.data)
+            datapath.send_msg(out)
