@@ -29,15 +29,17 @@ from mininet.log import setLogLevel, info
 def create_topology():
     """Tworzy i uruchamia niestandardową topologię sieci."""
 
-    # Tworzenie obiektu sieci. Używamy RemoteController, aby połączyć się
-    # z kontrolerem Ryu działającym na tym samym komputerze.
-    # Używamy TCLink, aby móc definiować parametry połączeń (jak przepustowość).
-    net = Mininet(
-        controller=lambda name: RemoteController(name, ip='127.0.0.1', port=6653),
-        switch=OVSKernelSwitch,
-        link=TCLink,
-        autoSetMacs=True
-    )
+    net = Mininet(controller=RemoteController, 
+                    switch=OVSKernelSwitch, 
+                    link=TCLink, 
+                    autoSetMacs=True)
+
+    info('*** Adding controller\n')
+    c0 = net.addController('c0', 
+                            controller=RemoteController, 
+                            ip='127.0.0.1', 
+                            protocol='tcp',
+                            port=6653)
 
     info('*** Dodawanie hostów\n')
     h1 = net.addHost('h1', ip='10.0.0.1/24')
@@ -66,7 +68,12 @@ def create_topology():
 
     info('*** Uruchamianie sieci\n')
     net.build()
-    net.start()
+    c0.start()
+    net.get('s1').start([c0])
+    net.get('s2').start([c0])
+    net.get('s3').start([c0])
+    net.get('s4').start([c0])
+    net.get('s5').start([c0])
 
     info('*** Uruchamianie interfejsu wiersza poleceń (CLI)\n')
     CLI(net)
