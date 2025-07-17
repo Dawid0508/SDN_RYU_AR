@@ -1,17 +1,4 @@
-# Copyright (C) 2011 Nippon Telegraph and Telephone Corporation.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-# implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# -*- coding: utf-8 -*-
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -21,187 +8,113 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
-from ryu.topology import event, switches
 from ryu.topology.api import get_switch, get_link
-import networkx as nx # <--- Użycie biblioteki networkx do operacji na grafach
+from ryu.topology import event
+import networkx as nx
 
 class SimpleSwitch13(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}
-        # <--- TUTAJ TWORZONY JEST GRAF SIECI
-        # DiGraph to graf skierowany, idealny do reprezentowania połączeń
-        self.net = nx.DiGraph() 
+        self.net = nx.DiGraph()
         self.topology_api_app = self
+        self.logger.info("--- Aplikacja Kontrolera FAMTAR (Dijkstra) uruchomiona ---")
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        # install table-miss flow entry
-        #
-        # We specify NO BUFFER to max_len of the output action due to
-        # OVS bug. At this moment, if we specify a max_len with valid
-        # buffer_id, controller will receive empty buffer_id and
-        # max_len still be 0.
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                            ofproto.OFPCML_NO_BUFFER)]
+                                          ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
+        self.logger.info(f"SWITCH: Podłączono przełącznik DPID: {datapath.id:016x}")
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+    def add_flow(self, datapath, priority, match, actions):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                                actions)]
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
-                                    instructions=inst)
-        else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst)
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                match=match, instructions=inst)
         datapath.send_msg(mod)
+        self.logger.info(f"FLOW: Instaluję regułę na DPID {datapath.id:016x} dla {match} -> {actions}")
 
-    # <--- TUTAJ KONTROLER ODKRYWA TOPOLOGIĘ SIECI
-    # Ten dekorator sprawia, że funkcja jest wywoływana, gdy Ryu odkryje nowe połączenie
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
+        self.logger.info("TOPOLOGY: Wykryto zmianę w topologii, aktualizuję graf...")
         switch_list = get_switch(self.topology_api_app, None)
         switches = [switch.dp.id for switch in switch_list]
         self.net.add_nodes_from(switches)
+        self.logger.info(f"TOPOLOGY: Znalezione przełączniki: {switches}")
 
         links_list = get_link(self.topology_api_app, None)
-        links = [(link.src.dpid, link.dst.dpid, {'port': link.src.port_no}) for link in links_list]
-        self.net.add_edges_from(links)
-        links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
-        self.net.add_edges_from(links)
+        for link in links_list:
+            # Dodajemy wagę '1' do każdego połączenia. To tu będziemy implementować FAMTAR.
+            self.net.add_edge(link.src.dpid, link.dst.dpid, port=link.src.port_no, weight=1)
+            self.net.add_edge(link.dst.dpid, link.src.dpid, port=link.dst.port_no, weight=1)
+        self.logger.info(f"TOPOLOGY: Znalezione połączenia: {self.net.edges()}")
 
-    # @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    # def _packet_in_handler(self, ev):
-    #     if ev.msg.msg_len < ev.msg.total_len:
-    #         self.logger.debug("packet truncated: only %s of %s bytes",
-    #                             ev.msg.msg_len, ev.msg.total_len)
-    #     msg = ev.msg
-    #     datapath = msg.datapath
-    #     ofproto = datapath.ofproto
-    #     parser = datapath.ofproto_parser
-    #     in_port = msg.match['in_port']
-
-    #     pkt = packet.Packet(msg.data)
-    #     eth = pkt.get_protocols(ethernet.ethernet)[0]
-
-    #     if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-    #         # ignore lldp packet
-    #         return
-            
-    #     dst = eth.dst
-    #     src = eth.src
-    #     dpid = datapath.id
-    #     self.mac_to_port.setdefault(dpid, {})
-
-    #     # learn a mac address to avoid FLOOD next time.
-    #     self.mac_to_port[dpid][src] = in_port
-
-    #     if dst in self.mac_to_port[dpid]:
-    #         out_port = self.mac_to_port[dpid][dst]
-    #     else:
-    #         out_port = ofproto.OFPP_FLOOD
-
-    #     # <--- KLUCZOWY MOMENT DLA DIJKSTRY I FAMTAR
-    #     if src not in self.net:
-    #         self.net.add_node(src)
-    #         self.net.add_edge(dpid, src, port=in_port)
-    #         self.net.add_edge(src, dpid)
-    #     if dst in self.net:
-    #         # <--- WYWOŁANIE ALGORYTMU DIJKSTRY Z NETWORKX
-    #         # Funkcja shortest_path domyślnie użyje atrybutu 'weight' krawędzi do obliczeń.
-    #         # Jeśli wagi nie są jawnie zdefiniowane, przyjmuje wartość 1.
-    #         path = nx.shortest_path(self.net, src, dst)
-    #         next = path[path.index(dpid) + 1]
-    #         out_port = self.net[dpid][next]['port']
-    #         self.mac_to_port[dpid][dst] = out_port
-
-    #     actions = [parser.OFPActionOutput(out_port)]
-
-    #     # install a flow to avoid packet_in next time
-    #     if out_port != ofproto.OFPP_FLOOD:
-    #         match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-    #         if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-    #             self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-    #             return
-    #         else:
-    #             self.add_flow(datapath, 1, match, actions)
-                
-    #     data = None
-    #     if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-    #         data = msg.data
-
-    #     out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-    #                                 in_port=in_port, actions=actions, data=data)
-    #     datapath.send_msg(out)
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+        dpid = datapath.id
         in_port = msg.match['in_port']
-
+        
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
+        dst = eth.dst
+        src = eth.src
 
-        # Ignoruj pakiety LLDP (służące do odkrywania topologii)
+        # Ignoruj LLDP
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
-        dst = eth.dst
-        src = eth.src
-        dpid = datapath.id
+        self.logger.info(f"\n--- Nowy pakiet ---")
+        self.logger.info(f"PACKET_IN: Otrzymano pakiet na DPID {dpid:016x} porcie {in_port}")
+        self.logger.info(f"           SRC: {src} -> DST: {dst}")
 
-        # Naucz się, gdzie jest host źródłowy (MAC)
-        # Dodaj go do grafu, jeśli jeszcze go tam nie ma
+        # Jeśli to ARP, oznacz go
+        if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            self.logger.info("           TYP: To jest pakiet ARP")
+
+        # Uczenie się źródła
         if src not in self.net:
             self.net.add_node(src)
-            self.net.add_edge(dpid, src, port=in_port)
-            self.net.add_edge(src, dpid)
+            self.net.add_edge(dpid, src, port=in_port, weight=0) # Połączenie host-switch ma koszt 0
+            self.net.add_edge(src, dpid, weight=0)
+            self.logger.info(f"LEARN: Nowy host {src} dodany do grafu, podłączony do {dpid} port {in_port}")
 
-        # Jeśli adres docelowy jest w grafie, oblicz ścieżkę
+        # Logika routingu
         if dst in self.net:
+            self.logger.info(f"ROUTE: Cel {dst} jest ZNANY. Obliczam ścieżkę Dijkstrą...")
             try:
-                # Oblicz ścieżkę za pomocą algorytmu Dijkstry (z wagami)
                 path = nx.shortest_path(self.net, src, dst, weight='weight')
+                self.logger.info(f"       -> Znaleziona ścieżka: {path}")
                 
-                # Znajdź następny krok w ścieżce i port wyjściowy
                 next_hop = path[path.index(dpid) + 1]
-                out_port = self.net[dpid][next_hop]['port']
+                out_port = self.net.get_edge_data(dpid, next_hop)['port']
+                self.logger.info(f"       -> Następny krok z {dpid} to {next_hop} przez port {out_port}")
 
-                # Zainstaluj regułę przepływu
-                actions = [parser.OFPActionOutput(out_port)]
-                match = parser.OFPMatch(eth_dst=dst, eth_src=src)
+                actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+                match = datapath.ofproto_parser.OFPMatch(eth_dst=dst)
                 self.add_flow(datapath, 1, match, actions)
 
-                # Wyślij pakiet
-                out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                          in_port=in_port, actions=actions, data=msg.data)
+                # Wyślij oryginalny pakiet tą ścieżką
+                out = datapath.ofproto_parser.OFPPacketOut(
+                    datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
+                    actions=actions, data=msg.data)
                 datapath.send_msg(out)
-
+                
             except nx.NetworkXNoPath:
-                # Jeśli z jakiegoś powodu nie ma ścieżki, zignoruj
-                self.logger.debug(f"Brak ścieżki z {src} do {dst}")
-                return
+                self.logger.warning(f"WARN: Cel {dst} jest w grafie, ale nie znaleziono ścieżki z {src}!")
         else:
-            # Jeśli nie znamy lokalizacji hosta docelowego, zalej sieć (FLOOD)
-            # To pozwoli pakietom ARP dotrzeć do celu i umożliwi naukę
-            out_port = ofproto.OFPP_FLOOD
-            actions = [parser.OFPActionOutput(out_port)]
-            
-            # Wyślij pakiet
-            out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
-                                      in_port=in_port, actions=actions, data=msg.data)
+            self.logger.info(f"ROUTE: Cel {dst} jest NIEZNANY. Zalewam sieć (FLOOD)...")
+            out_port = datapath.ofproto.OFPP_FLOOD
+            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+            out = datapath.ofproto_parser.OFPPacketOut(
+                datapath=datapath, buffer_id=ofproto_v1_3.OFP_NO_BUFFER,
+                in_port=in_port, actions=actions, data=msg.data)
             datapath.send_msg(out)
