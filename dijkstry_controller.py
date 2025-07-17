@@ -79,36 +79,49 @@ class PathfindingController(app_manager.RyuApp):
         if dst in self.mac_to_port:
             dst_dpid, dst_port = self.mac_to_port[dst]
             
-            # Oblicz ścieżkę między przełącznikami
-            path = nx.shortest_path(self.net, dpid, dst_dpid, weight='weight')
-            self.logger.info(f"ROUTE: Znaleziona ścieżka z {dpid} do {dst_dpid}: {path}")
+            self.logger.info(f"ROUTE: Cel {dst} jest znany (na {dst_dpid}). Próbuję znaleźć ścieżkę z {dpid} do {dst_dpid}.")
+            # Logujemy stan grafu tuż przed próbą znalezienia ścieżki
+            self.logger.info(f"       -> Stan grafu: Węzły={list(self.net.nodes())}, Połączenia={list(self.net.edges())}")
 
-            # Zainstaluj reguły na całej ścieżce
-            for i in range(len(path)):
-                current_dpid = path[i]
+            try:
+                # Spróbuj znaleźć najkrótszą ścieżkę
+                path = nx.shortest_path(self.net, dpid, dst_dpid, weight='weight')
+                self.logger.info(f"       -> SUKCES! Znaleziona ścieżka: {path}")
+
+                # Zainstaluj reguły na całej ścieżce
+                # (Kod instalacji reguł pozostaje taki sam)
+                for i in range(len(path)):
+                    current_dpid = path[i]
+                    if i < len(path) - 1:
+                        next_dpid = path[i+1]
+                        out_port = self.net.get_edge_data(current_dpid, next_dpid)['port']
+                    else:
+                        out_port = dst_port
+
+                    dp = self.dpset.get(current_dpid)
+                    if dp:
+                        match = dp.ofproto_parser.OFPMatch(eth_dst=dst)
+                        actions = [dp.ofproto_parser.OFPActionOutput(out_port)]
+                        self.add_flow(dp, 1, match, actions)
                 
-                # Ustal port wyjściowy
-                if i < len(path) - 1: # Jeśli to nie jest ostatni przełącznik na ścieżce
-                    next_dpid = path[i+1]
-                    out_port = self.net.get_edge_data(current_dpid, next_dpid)['port']
-                else: # Jeśli to ostatni przełącznik, portem wyjściowym jest port hosta
-                    out_port = dst_port
+                # Wyślij oryginalny pakiet
+                actions = [datapath.ofproto_parser.OFPActionOutput(self.net.get_edge_data(dpid, path[1])['port'] if len(path) > 1 else dst_port)]
+                out = datapath.ofproto_parser.OFPPacketOut(
+                    datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
+                    actions=actions, data=msg.data)
+                datapath.send_msg(out)
 
-                # Zainstaluj regułę
-                dp = self.dpset.get(current_dpid)
-                if dp:
-                    match = dp.ofproto_parser.OFPMatch(eth_dst=dst)
-                    actions = [dp.ofproto_parser.OFPActionOutput(out_port)]
-                    self.add_flow(dp, 1, match, actions)
-            
-            # Wyślij oryginalny pakiet (już zainstalowaną ścieżką)
-            actions = [datapath.ofproto_parser.OFPActionOutput(self.net.get_edge_data(dpid, path[1])['port'] if len(path) > 1 else dst_port)]
-            out = datapath.ofproto_parser.OFPPacketOut(
-                datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
-                actions=actions, data=msg.data)
-            datapath.send_msg(out)
-
-        else: # Cel nieznany, zalej sieć
+            except nx.NetworkXNoPath:
+                # --- TO JEST KLUCZOWA ZMIANA ---
+                # Jeśli nie ma ścieżki, nie powoduj awarii. Zamiast tego zalewamy sieć.
+                self.logger.warning(f"WARN: Nie znaleziono ścieżki z {dpid} do {dst_dpid}. Mapa może być niekompletna. Tymczasowo zalewam sieć (FLOOD).")
+                actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)]
+                out = datapath.ofproto_parser.OFPPacketOut(
+                    datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER, 
+                    in_port=in_port, actions=actions, data=msg.data)
+                datapath.send_msg(out)
+        else:
+            # Cel nieznany, zalewamy sieć
             self.logger.info(f"ROUTE: Cel {dst} jest nieznany. Zalewam sieć (FLOOD).")
             actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)]
             out = datapath.ofproto_parser.OFPPacketOut(
