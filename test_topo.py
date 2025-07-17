@@ -73,7 +73,6 @@ def create_topology():
     net.get('s2').start([c0])
     net.get('s3').start([c0])
     net.get('s4').start([c0])
-    net.get('s5').start([c0])
 
     info('*** Uruchamianie interfejsu wiersza poleceń (CLI)\n')
     CLI(net)
