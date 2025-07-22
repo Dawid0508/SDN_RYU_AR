@@ -23,21 +23,11 @@ class FamtarController(app_manager.RyuApp):
         
         # --- Logika FAMTAR ---
         self.monitor_thread = hub.spawn(self._monitor)
-        self.port_stats = {} # { (dpid, port): (tx_bytes, rx_bytes) }
-        self.port_speed = {} # { (dpid, port): speed_in_Bps }
-        self.link_to_port = {} # { (dpid1, dpid2): port_on_dpid1 }
-        self.congestion_state = {} # { (dpid1, dpid2): True/False }
-        self.logger.info("--- Kontroler FAMTAR v1.0 uruchomiony ---")
-
-    # --- Podstawowa obsługa przełączników ---
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
+        self.port_stats = {}
+        self.port_speed = {}
+        self.link_to_port = {}
+        self.congestion_state = {}
+        self.logger.info("--- Kontroler FAMTAR v1.1 (Poprawiony) uruchomiony ---")
 
     def add_flow(self, datapath, priority, match, actions):
         ofproto = datapath.ofproto
@@ -45,22 +35,35 @@ class FamtarController(app_manager.RyuApp):
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst)
         datapath.send_msg(mod)
+        self.logger.info(f"FLOW: Instaluję regułę na DPID {datapath.id:016x} dla {match} -> {actions}")
 
-    # --- Budowanie topologii ---
+    # --- Budowanie topologii i instalacja reguły table-miss ---
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
-        self.net.add_node(ev.switch.dp.id)
-        self.logger.info(f"TOPOLOGY: Dodano przełącznik {ev.switch.dp.id} do grafu.")
+        datapath = ev.switch.dp
+        dpid = datapath.id
+        self.net.add_node(dpid)
+        self.logger.info(f"TOPOLOGY: Dodano przełącznik {dpid} do grafu.")
+
+        # WAŻNA ZMIANA: Instalujemy regułę table-miss tutaj, bo wiemy, że ta funkcja działa.
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow(datapath, 0, match, actions)
 
     @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
     def link_add_handler(self, ev):
         link = ev.link
         s1, s2 = link.src.dpid, link.dst.dpid
-        p1 = link.src.port_no
+        p1, p2 = link.src.port_no, link.dst.port_no
         self.net.add_edge(s1, s2, port=p1, weight=1)
+        self.net.add_edge(s2, s1, port=p2, weight=1)
         self.link_to_port[(s1, s2)] = p1
+        self.link_to_port[(s2, s1)] = p2
         self.congestion_state.setdefault((s1, s2), False)
-        self.logger.info(f"TOPOLOGY: Dodano połączenie {s1}:{p1} -> {s2}")
+        self.congestion_state.setdefault((s2, s1), False)
+        self.logger.info(f"TOPOLOGY: Dodano połączenie dwukierunkowe {s1} <-> {s2}")
 
     # --- Mechanizm monitorowania FAMTAR ---
     def _monitor(self):
@@ -68,7 +71,7 @@ class FamtarController(app_manager.RyuApp):
         while True:
             for dp in self.dpset.get_all():
                 self._request_stats(dp[1])
-            hub.sleep(5) # Odpytuj co 5 sekund
+            hub.sleep(5)
 
     def _request_stats(self, datapath):
         ofproto = datapath.ofproto
@@ -86,12 +89,12 @@ class FamtarController(app_manager.RyuApp):
             key = (dpid, port_no)
             
             if key in self.port_stats:
-                prev_tx = self.port_stats[key][0]
+                prev_tx = self.port_stats[key]
                 delta_tx = stat.tx_bytes - prev_tx
-                speed = delta_tx / 5 # Prędkość w Bajtach/s (interwał 5s)
-                self.port_speed[key] = speed * 8 # Prędkość w bitach/s
+                speed_bps = (delta_tx * 8) / 5
+                self.port_speed[key] = speed_bps
             
-            self.port_stats[key] = (stat.tx_bytes, stat.rx_bytes)
+            self.port_stats[key] = stat.tx_bytes
         
         self.update_link_costs()
 
@@ -99,25 +102,21 @@ class FamtarController(app_manager.RyuApp):
         for (s1, s2), port in self.link_to_port.items():
             key = (s1, port)
             if key in self.port_speed:
-                speed_mbps = self.port_speed[key] / (1024*1024)
-                
-                # Zgodnie z PDF, pojemność core links to 100 Mbit/s [cite: 180]
-                link_capacity_mbps = 100 
-                Th_max = 0.9 * link_capacity_mbps # 90% pojemności 
-                Th_min = 0.7 * link_capacity_mbps # 70% pojemności 
+                speed_mbps = self.port_speed[key] / (1000*1000)
+                link_capacity_mbps = 100 if s2 != 3 else 10 # Proste założenie na podstawie topologii
+                Th_max = 0.9 * link_capacity_mbps
+                Th_min = 0.7 * link_capacity_mbps
                 
                 is_congested = self.congestion_state.get((s1, s2), False)
 
                 if speed_mbps > Th_max and not is_congested:
-                    # Przekroczono próg - ustaw wysoką wagę
                     self.net[s1][s2]['weight'] = 1000
                     self.congestion_state[(s1, s2)] = True
-                    self.logger.warning(f"FAMTAR: Przeciążenie na linku {s1}->{s2}! Zwiększono koszt do 1000.")
+                    self.logger.warning(f"FAMTAR: Przeciążenie na linku {s1}->{s2}! Koszt=1000. (Szybkość: {speed_mbps:.2f} Mbps)")
                 elif speed_mbps < Th_min and is_congested:
-                    # Obciążenie spadło - przywróć normalną wagę
                     self.net[s1][s2]['weight'] = 1
                     self.congestion_state[(s1, s2)] = False
-                    self.logger.info(f"FAMTAR: Koniec przeciążenia na {s1}->{s2}. Przywrócono koszt 1.")
+                    self.logger.info(f"FAMTAR: Koniec przeciążenia na {s1}->{s2}. Koszt=1. (Szybkość: {speed_mbps:.2f} Mbps)")
 
     # --- Logika routingu (PacketIn) ---
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -128,62 +127,40 @@ class FamtarController(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         dpid = datapath.id
         in_port = msg.match['in_port']
-
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            return
-            
-        dst = eth.dst
-        src = eth.src
-
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP: return
+        
+        dst, src = eth.dst, eth.src
         if src not in self.mac_to_port:
             self.mac_to_port[src] = (dpid, in_port)
 
         if dst in self.mac_to_port:
             dst_dpid, dst_port = self.mac_to_port[dst]
-            
             try:
                 path = nx.shortest_path(self.net, dpid, dst_dpid, weight='weight')
-                
-                # Instalacja reguł na całej ścieżce
                 for i in range(len(path)):
                     current_dpid = path[i]
-                    if i < len(path) - 1:
-                        next_dpid = path[i+1]
-                        out_port = self.net.get_edge_data(current_dpid, next_dpid)['port']
-                    else:
-                        out_port = dst_port
-                    
+                    out_port = dst_port if i == len(path) - 1 else self.net.get_edge_data(current_dpid, path[i+1])['port']
                     dp = self.dpset.get(current_dpid)
                     if dp:
-                        match = dp.ofproto_parser.OFPMatch(eth_dst=dst)
-                        actions = [dp.ofproto_parser.OFPActionOutput(out_port)]
+                        match = parser.OFPMatch(eth_dst=dst)
+                        actions = [parser.OFPActionOutput(out_port)]
                         self.add_flow(dp, 1, match, actions)
                 
-                # --- TUTAJ BYŁ BŁĄD ---
-                # Wyślij oryginalny pakiet, również z OFP_NO_BUFFER
-                actions = [datapath.ofproto_parser.OFPActionOutput(self.net.get_edge_data(dpid, path[1])['port'] if len(path) > 1 else dst_port)]
-                out = datapath.ofproto_parser.OFPPacketOut(
-                    datapath=datapath,
-                    buffer_id=ofproto.OFP_NO_BUFFER, # <--- POPRAWIONA LINIA
-                    in_port=in_port,
-                    actions=actions,
-                    data=msg.data)
+                actions = [parser.OFPActionOutput(self.net.get_edge_data(dpid, path[1])['port'] if len(path) > 1 else dst_port)]
+                out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER, in_port=in_port, actions=actions, data=msg.data)
                 datapath.send_msg(out)
-
             except nx.NetworkXNoPath:
-                # Fallback do zalewania, jeśli mapa jest niekompletna
                 self.flood(msg)
         else:
-            # Cel nieznany, zalewamy sieć
             self.flood(msg)
+
     def flood(self, msg):
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-        out = parser.OFPPacketOut(datapath=datapath, 
-                                    buffer_id=ofproto.OFP_NO_BUFFER, in_port=msg.match['in_port'], actions=actions, data=msg.data)
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER, in_port=msg.match['in_port'], actions=actions, data=msg.data)
         datapath.send_msg(out)
