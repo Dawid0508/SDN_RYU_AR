@@ -124,22 +124,30 @@ class FamtarController(app_manager.RyuApp):
     def _packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
         dpid = datapath.id
         in_port = msg.match['in_port']
+
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP: return
-        
-        dst, src = eth.dst, eth.src
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+            return
+            
+        dst = eth.dst
+        src = eth.src
+
         if src not in self.mac_to_port:
             self.mac_to_port[src] = (dpid, in_port)
 
         if dst in self.mac_to_port:
             dst_dpid, dst_port = self.mac_to_port[dst]
+            
             try:
                 path = nx.shortest_path(self.net, dpid, dst_dpid, weight='weight')
-                # Logika instalacji reguł... (pozostaje bez zmian)
+                
+                # Instalacja reguł na całej ścieżce
                 for i in range(len(path)):
                     current_dpid = path[i]
                     if i < len(path) - 1:
@@ -147,26 +155,35 @@ class FamtarController(app_manager.RyuApp):
                         out_port = self.net.get_edge_data(current_dpid, next_dpid)['port']
                     else:
                         out_port = dst_port
+                    
                     dp = self.dpset.get(current_dpid)
                     if dp:
                         match = dp.ofproto_parser.OFPMatch(eth_dst=dst)
                         actions = [dp.ofproto_parser.OFPActionOutput(out_port)]
                         self.add_flow(dp, 1, match, actions)
                 
-                # Wyślij pakiet
+                # --- TUTAJ BYŁ BŁĄD ---
+                # Wyślij oryginalny pakiet, również z OFP_NO_BUFFER
                 actions = [datapath.ofproto_parser.OFPActionOutput(self.net.get_edge_data(dpid, path[1])['port'] if len(path) > 1 else dst_port)]
-                out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
+                out = datapath.ofproto_parser.OFPPacketOut(
+                    datapath=datapath,
+                    buffer_id=ofproto.OFP_NO_BUFFER, # <--- POPRAWIONA LINIA
+                    in_port=in_port,
+                    actions=actions,
+                    data=msg.data)
                 datapath.send_msg(out)
+
             except nx.NetworkXNoPath:
                 # Fallback do zalewania, jeśli mapa jest niekompletna
                 self.flood(msg)
-        else: # Cel nieznany
+        else:
+            # Cel nieznany, zalewamy sieć
             self.flood(msg)
-            
     def flood(self, msg):
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER, in_port=msg.match['in_port'], actions=actions, data=msg.data)
+        out = parser.OFPPacketOut(datapath=datapath, 
+                                    buffer_id=ofproto.OFP_NO_BUFFER, in_port=msg.match['in_port'], actions=actions, data=msg.data)
         datapath.send_msg(out)
