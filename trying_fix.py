@@ -27,6 +27,21 @@ class FamtarController(app_manager.RyuApp):
         self.link_to_port = {}
         self.congestion_state = {}
         self.logger.info("--- Kontroler FAMTAR v3.0 (Ostateczny) uruchomiony ---")
+        self.logger.info("RĘCZNE TWORZENIE GRAFU TOPOLOGII...")
+        # Węzły (przełączniki)
+        self.net.add_nodes_from([1, 2, 3, 4])
+        # Połączenia (s1<->s2, s2<->s4, s1<->s3, s3<->s4)
+        # Porty znamy z pliku test_topo.py (pierwszy wolny port to 2, bo 1 jest do hosta)
+        # To są przykładowe porty, mogą być inne w Twoim Mininet (np. s1-eth2)
+        self.net.add_edge(1, 2, port=2, weight=1)
+        self.net.add_edge(2, 1, port=1, weight=1)
+        self.net.add_edge(2, 4, port=2, weight=1)
+        self.net.add_edge(4, 2, port=2, weight=1)
+        self.net.add_edge(1, 3, port=3, weight=1)
+        self.net.add_edge(3, 1, port=1, weight=1)
+        self.net.add_edge(3, 4, port=2, weight=1)
+        self.net.add_edge(4, 3, port=3, weight=1)
+        self.logger.info(f"GRAF ZBUDOWANY: {self.net.edges()}")
 
     def add_flow(self, datapath, priority, match, actions):
         ofproto = datapath.ofproto
