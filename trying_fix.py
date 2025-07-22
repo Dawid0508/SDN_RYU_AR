@@ -159,8 +159,8 @@ class FamtarController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         out = parser.OFPPacketOut(datapath=datapath,
-                                    buffer_id=ofproto.OFP_NO_BUFFER,
-                                    in_port=msg.match['in_port'],
-                                    actions=actions,
-                                    data=msg.data)
+                                  buffer_id=ofproto.OFP_NO_BUFFER,
+                                  in_port=msg.match['in_port'],
+                                  actions=actions,
+                                  data=msg.data)
         datapath.send_msg(out)
