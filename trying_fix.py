@@ -26,7 +26,7 @@ class FamtarController(app_manager.RyuApp):
         self.port_speed = {}
         self.link_to_port = {}
         self.congestion_state = {}
-        self.logger.info("--- Kontroler FAMTAR v2.0 (Proaktywny) uruchomiony ---")
+        self.logger.info("--- Kontroler FAMTAR v3.0 (Ostateczny) uruchomiony ---")
 
     def add_flow(self, datapath, priority, match, actions):
         ofproto = datapath.ofproto
@@ -34,7 +34,6 @@ class FamtarController(app_manager.RyuApp):
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst)
         datapath.send_msg(mod)
-        self.logger.info(f"FLOW: Instaluję regułę na DPID {datapath.id:016x} dla {match} -> {actions}")
 
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
@@ -47,7 +46,9 @@ class FamtarController(app_manager.RyuApp):
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
+        self.logger.info(f"FLOW: Zainstalowano regułę table-miss na {datapath.id}")
 
+    # Poprawiony dekorator bez dispatcher'a, aby zawsze łapać zdarzenia
     @set_ev_cls(event.EventLinkAdd)
     def link_add_handler(self, ev):
         s1, s2 = ev.link.src.dpid, ev.link.dst.dpid
@@ -88,6 +89,7 @@ class FamtarController(app_manager.RyuApp):
         for (s1, s2), port in self.link_to_port.items():
             key = (s1, port)
             speed_mbps = self.port_speed.get(key, 0) / (1000*1000)
+            # Poprawiona logika wykrywania pojemności
             link_capacity_mbps = 10 if 3 in (s1, s2) else 100
             Th_max, Th_min = 0.9 * link_capacity_mbps, 0.7 * link_capacity_mbps
             is_congested = self.congestion_state.get((s1, s2), False)
@@ -121,7 +123,6 @@ class FamtarController(app_manager.RyuApp):
             try:
                 path = nx.shortest_path(self.net, dpid, dst_dpid, weight='weight')
                 
-                # --- PROAKTYWNA INSTALACJA - PONIŻSZA PĘTLA ROZWIĄZUJE PROBLEM Z PRĘDKOŚCIĄ ---
                 for i in range(len(path)):
                     current_dpid = path[i]
                     out_port = dst_port if i == len(path) - 1 else self.net.get_edge_data(current_dpid, path[i+1])['port']
@@ -131,7 +132,6 @@ class FamtarController(app_manager.RyuApp):
                         actions = [parser.OFPActionOutput(out_port)]
                         self.add_flow(dp, 1, match, actions)
                 
-                # Wyślij pierwszy pakiet, kolejne polecą już po zainstalowanych regułach
                 out_port_first_hop = dst_port if len(path) <= 1 else self.net.get_edge_data(dpid, path[1])['port']
                 actions = [parser.OFPActionOutput(out_port_first_hop)]
                 self._send_packet_out(datapath, msg, actions)
