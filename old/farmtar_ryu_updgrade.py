@@ -43,16 +43,15 @@ class FAMTARController(app_manager.RyuApp):
         self.topology_lock = threading.Lock() # Zabezpiecza switches i adjacency
         self.mac_learning_lock = threading.Lock() # Zabezpiecza mac_to_dpid i mac_to_port
 
-        # --- Uruchomienie zadań w tle w sposób zgodny z Ryu ---
+        self.logger.info("Kontroler FAMTAR zainicjowany.")
 
-        self.logger.info("Kontroler FAMTAR zainicjowany. Wątki monitoringu i czyszczenia uruchomione.")
-        
     def start(self):
         """Metoda wywoływana po zainicjowaniu aplikacji, idealna do startowania pętli."""
         super(FAMTARController, self).start()
         self.monitor_thread = self.hub.spawn(self._request_stats_loop)
         self.cleanup_thread = self.hub.spawn(self._cleanup_fft_loop)
         self.logger.info("Uruchomiono wątki monitoringu i czyszczenia FFT.")
+
     # --- Funkcje Pomocnicze jako metody klasy ---
 
     def _minimum_distance(self, distance, Q):
@@ -67,7 +66,7 @@ class FAMTARController(app_manager.RyuApp):
     def _calculate_path(self, src, dst):
         with self.topology_lock:
             if src not in self.switches or dst not in self.switches:
-                self.logger.warning(f"Próba obliczenia ścieżki dla nieznanych przełączników: src={src}, dst={dst}")
+                self.logger.warning("Próba obliczenia ścieżki dla nieznanych przełączników: src={0}, dst={1}".format(src, dst))
                 return None
 
             distance = {node: float('inf') for node in self.switches}
@@ -100,7 +99,7 @@ class FAMTARController(app_manager.RyuApp):
                 current = previous.get(current)
 
             if not path or path[0] != src:
-                self.logger.warning(f"Nie znaleziono ścieżki z {src} do {dst}")
+                self.logger.warning("Nie znaleziono ścieżki z {0} do {1}".format(src, dst))
                 return None
 
             return path
@@ -110,14 +109,14 @@ class FAMTARController(app_manager.RyuApp):
         with self.topology_lock:
             for s1, s2 in zip(path[:-1], path[1:]):
                 if s2 not in self.adjacency[s1]:
-                    self.logger.error(f"Błąd: Brak definicji łącza między {s1} a {s2} w adjacency.")
+                    self.logger.error("Błąd: Brak definicji łącza między {0} a {1} w adjacency.".format(s1, s2))
                     return None
                 out_port = self.adjacency[s1][s2]["port"]
                 in_port = self.adjacency[s2][s1]["port"]
                 ports.append((s1, in_port, out_port))
         
         if len(ports) != len(path) - 1:
-            self.logger.error(f"Błąd: Nie udało się uzyskać portów dla całej ścieżki {path}.")
+            self.logger.error("Błąd: Nie udało się uzyskać portów dla całej ścieżki {0}.".format(path))
             return None
             
         return ports
@@ -135,7 +134,7 @@ class FAMTARController(app_manager.RyuApp):
                 elif udp_header:
                     src_port, dst_port = udp_header.src_port, udp_header.dst_port
         except Exception as e:
-            self.logger.error(f"Wyjątek podczas parsowania pakietu dla flow_id: {e}", exc_info=True)
+            self.logger.error("Wyjątek podczas parsowania pakietu dla flow_id: {0}".format(e), exc_info=True)
 
         flow_tuple = (eth_src, eth_dst, ip_proto, src_port, dst_port, in_port)
         return hashlib.md5(str(flow_tuple).encode('utf-8')).hexdigest()
@@ -149,20 +148,20 @@ class FAMTARController(app_manager.RyuApp):
         datapath.send_msg(mod)
 
     def _install_path(self, path, flow_id, src_mac, dst_mac, final_out_port, original_in_port):
-        self.logger.info(f"--- Instalacja ścieżki dla flow_id: {flow_id} ---")
-        self.logger.info(f"    Ścieżka DPID: {path}")
+        self.logger.info("--- Instalacja ścieżki dla flow_id: {0} ---".format(flow_id))
+        self.logger.info("    Ścieżka DPID: {0}".format(path))
 
         first_switch_out_port = None
         if len(path) > 1:
             with self.topology_lock:
                 first_switch_out_port = self.adjacency[path[0]].get(path[1], {}).get("port")
         elif len(path) == 1: # Hosty na tym samym przełączniku
-             first_switch_out_port = final_out_port
+            first_switch_out_port = final_out_port
         
         for i, dpid in enumerate(path):
             datapath = self.datapaths.get(dpid)
             if not datapath:
-                self.logger.error(f"    Błąd: Brak datapath dla przełącznika {dpid}.")
+                self.logger.error("    Błąd: Brak datapath dla przełącznika {0}.".format(dpid))
                 continue
 
             parser = datapath.ofproto_parser
@@ -180,22 +179,22 @@ class FAMTARController(app_manager.RyuApp):
                     out_port = final_out_port
             
             if in_port is None or out_port is None:
-                self.logger.error(f"    Błąd: Nie można ustalić portu in/out dla switcha {dpid}. In: {in_port}, Out: {out_port}")
+                self.logger.error("    Błąd: Nie można ustalić portu in/out dla switcha {0}. In: {1}, Out: {2}".format(dpid, in_port, out_port))
                 continue
 
             match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
             actions = [parser.OFPActionOutput(out_port)]
             self._add_flow(datapath, match, actions, priority=2, idle_timeout=IDLE_TIMEOUT)
-            self.logger.info(f"    Instalacja: switch={dpid}, in_port={in_port}, out_port={out_port}")
+            self.logger.info("    Instalacja: switch={0}, in_port={1}, out_port={2}".format(dpid, in_port, out_port))
 
         # Aktualizacja FFT
         with self.fft_lock:
             if first_switch_out_port is not None:
                 self.fft[flow_id] = (first_switch_out_port, time.time())
-                self.logger.debug(f"    Dodano/zaktualizowano FFT: flow_id={flow_id}, out_port={first_switch_out_port}")
+                self.logger.debug("    Dodano/zaktualizowano FFT: flow_id={0}, out_port={1}".format(flow_id, first_switch_out_port))
             else:
-                self.logger.warning(f"    Nie udało się ustalić portu dla pierwszego kroku do aktualizacji FFT.")
-        self.logger.info(f"--- Zakończono instalację ścieżki dla flow_id: {flow_id} ---")
+                self.logger.warning("    Nie udało się ustalić portu dla pierwszego kroku do aktualizacji FFT.")
+        self.logger.info("--- Zakończono instalację ścieżki dla flow_id: {0} ---".format(flow_id))
 
     # --- Handlery Zdarzeń ---
 
@@ -211,9 +210,9 @@ class FAMTARController(app_manager.RyuApp):
         # Domyślna reguła "table-miss" - pakiety do kontrolera
         match = datapath.ofproto_parser.OFPMatch()
         actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_CONTROLLER,
-                                                           datapath.ofproto.OFPCML_NO_BUFFER)]
+                                                            datapath.ofproto.OFPCML_NO_BUFFER)]
         self._add_flow(datapath, match, actions, priority=0)
-        self.logger.info(f"Skonfigurowano domyślną regułę dla przełącznika {dpid}.")
+        self.logger.info("Skonfigurowano domyślną regułę dla przełącznika {0}.".format(dpid))
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -228,16 +227,16 @@ class FAMTARController(app_manager.RyuApp):
             return
 
         dst_mac, src_mac = eth.dst, eth.src
-        self.logger.info(f"--- PacketIn: Switch={dpid}, InPort={in_port}, Src={src_mac}, Dst={dst_mac} ---")
+        self.logger.info("--- PacketIn: Switch={0}, InPort={1}, Src={2}, Dst={3} ---".format(dpid, in_port, src_mac, dst_mac))
         
         # --- Nauka MAC -> Port & MAC -> DPID ---
         with self.mac_learning_lock:
             if self.mac_to_port[dpid].get(src_mac) != in_port:
                 self.mac_to_port[dpid][src_mac] = in_port
-                self.logger.info(f"    Nauczono: Switch {dpid}, MAC {src_mac} -> Port {in_port}")
+                self.logger.info("    Nauczono: Switch {0}, MAC {1} -> Port {2}".format(dpid, src_mac, in_port))
             if self.mac_to_dpid.get(src_mac) != dpid:
                 self.mac_to_dpid[src_mac] = dpid
-                self.logger.info(f"    Nauczono: MAC {src_mac} -> DPID {dpid}")
+                self.logger.info("    Nauczono: MAC {0} -> DPID {1}".format(src_mac, dpid))
 
         flow_id = self._calculate_flow_id(pkt, in_port, src_mac, dst_mac)
         
@@ -247,15 +246,15 @@ class FAMTARController(app_manager.RyuApp):
             if fft_entry and (time.time() - fft_entry[1] <= FFT_IDLE_TIMEOUT):
                 out_port_fft, _ = fft_entry
                 self.fft[flow_id] = (out_port_fft, time.time()) # Odśwież timestamp
-                self.logger.info(f"    Trafienie w FFT! Wysyłanie na port {out_port_fft}.")
+                self.logger.info("    Trafienie w FFT! Wysyłanie na port {0}.".format(out_port_fft))
                 actions = [datapath.ofproto_parser.OFPActionOutput(out_port_fft)]
                 out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                          in_port=in_port, actions=actions, data=msg.data)
+                                            in_port=in_port, actions=actions, data=msg.data)
                 datapath.send_msg(out)
                 return
             elif fft_entry:
                 del self.fft[flow_id]
-                self.logger.info(f"    Usunięto przestarzały wpis z FFT: {flow_id}")
+                self.logger.info("    Usunięto przestarzały wpis z FFT: {0}".format(flow_id))
 
         # --- Logika routingu (jeśli nie ma w FFT) ---
         dst_dpid = self.mac_to_dpid.get(dst_mac)
@@ -264,21 +263,21 @@ class FAMTARController(app_manager.RyuApp):
         if dst_dpid == dpid: # Cel na tym samym przełączniku
             out_port = self.mac_to_port[dpid].get(dst_mac)
             if out_port:
-                self.logger.info(f"    Cel na tym samym przełączniku {dpid}, port {out_port}")
+                self.logger.info("    Cel na tym samym przełączniku {0}, port {1}".format(dpid, out_port))
                 actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
                 match = datapath.ofproto_parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
                 self._add_flow(datapath, match, actions, priority=2, idle_timeout=IDLE_TIMEOUT)
                 with self.fft_lock: # Zapis do FFT
                     self.fft[flow_id] = (out_port, time.time())
             else: # Rzadki przypadek, ale możliwy
-                self.logger.warning(f"    Nie znam portu dla {dst_mac} na {dpid}, zalewam.")
+                self.logger.warning("    Nie znam portu dla {0} na {1}, zalewam.".format(dst_mac, dpid))
                 actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)]
 
         elif dst_dpid: # Cel na innym znanym przełączniku
-            self.logger.info(f"    Cel na przełączniku {dst_dpid}. Obliczanie ścieżki z {dpid}...")
+            self.logger.info("    Cel na przełączniku {0}. Obliczanie ścieżki z {1}...".format(dst_dpid, dpid))
             path = self._calculate_path(dpid, dst_dpid)
             if path:
-                self.logger.info(f"    Znaleziona ścieżka: {path}")
+                self.logger.info("    Znaleziona ścieżka: {0}".format(path))
                 final_out_port = self.mac_to_port.get(dst_dpid, {}).get(dst_mac)
                 if final_out_port:
                     self._install_path(path, flow_id, src_mac, dst_mac, final_out_port, in_port)
@@ -286,19 +285,19 @@ class FAMTARController(app_manager.RyuApp):
                     first_hop_out_port = self._get_ports_for_path(path)[0][2]
                     actions = [datapath.ofproto_parser.OFPActionOutput(first_hop_out_port)]
                 else:
-                    self.logger.warning(f"    Nie znam portu końcowego dla {dst_mac} na {dst_dpid}. Zalewam.")
+                    self.logger.warning("    Nie znam portu końcowego dla {0} na {1}. Zalewam.".format(dst_mac, dst_dpid))
                     actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)]
             else:
-                self.logger.warning(f"    Nie znaleziono ścieżki z {dpid} do {dst_dpid}. Zalewam.")
+                self.logger.warning("    Nie znaleziono ścieżki z {0} do {1}. Zalewam.".format(dpid, dst_dpid))
                 actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)]
         
         else: # Cel nieznany
-            self.logger.warning(f"    Nieznany MAC docelowy: {dst_mac}. Zalewam.")
+            self.logger.warning("    Nieznany MAC docelowy: {0}. Zalewam.".format(dst_mac))
             actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)]
 
         # Wysyłanie pakietu
         out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=msg.data)
+                                    in_port=in_port, actions=actions, data=msg.data)
         datapath.send_msg(out)
 
     @set_ev_cls(event.EventSwitchEnter)
@@ -310,7 +309,7 @@ class FAMTARController(app_manager.RyuApp):
                 self.switches.append(dpid)
                 self.datapaths[dpid] = switch.dp
                 self.mac_to_port.setdefault(dpid, {})
-                self.logger.info(f"Przełącznik dołączył do topologii: {dpid}")
+                self.logger.info("Przełącznik dołączył do topologii: {0}".format(dpid))
 
     @set_ev_cls(event.EventSwitchLeave)
     def switch_leave_handler(self, ev):
@@ -328,7 +327,7 @@ class FAMTARController(app_manager.RyuApp):
             keys_to_remove = [mac for mac, dp in self.mac_to_dpid.items() if dp == dpid]
             for key in keys_to_remove:
                 del self.mac_to_dpid[key]
-        self.logger.info(f"Przełącznik opuścił topologię: {dpid}")
+        self.logger.info("Przełącznik opuścił topologię: {0}".format(dpid))
 
     @set_ev_cls(event.EventLinkAdd)
     def link_add_handler(self, ev):
@@ -339,7 +338,7 @@ class FAMTARController(app_manager.RyuApp):
             if src_dpid in self.switches and dst_dpid in self.switches:
                 self.adjacency[src_dpid][dst_dpid] = {"port": src_port, "cost": DEFAULT_COST}
                 self.adjacency[dst_dpid][src_dpid] = {"port": dst_port, "cost": DEFAULT_COST}
-                self.logger.info(f"Łącze dodane: {src_dpid}:{src_port} <-> {dst_dpid}:{dst_port}")
+                self.logger.info("Łącze dodane: {0}:{1} <-> {2}:{3}".format(src_dpid, src_port, dst_dpid, dst_port))
             else:
                 self.logger.warning("Ignorowanie łącza - jeden z przełączników nie jest jeszcze znany.")
 
@@ -352,7 +351,7 @@ class FAMTARController(app_manager.RyuApp):
                 del self.adjacency[src_dpid][dst_dpid]
             if self.adjacency[dst_dpid] and self.adjacency[dst_dpid][src_dpid]:
                 del self.adjacency[dst_dpid][src_dpid]
-        self.logger.info(f"Łącze usunięte: {src_dpid} <-> {dst_dpid}")
+        self.logger.info("Łącze usunięte: {0} <-> {1}".format(src_dpid, dst_dpid))
         
     # --- Pętle monitorujące ---
 
@@ -366,13 +365,13 @@ class FAMTARController(app_manager.RyuApp):
                 try:
                     datapath.send_msg(req)
                 except Exception as e:
-                    self.logger.error(f"Błąd podczas wysyłania żądania statystyk do {datapath.id}: {e}")
+                    self.logger.error("Błąd podczas wysyłania żądania statystyk do {0}: {1}".format(datapath.id, e))
             self.hub.sleep(STATS_REQUEST_INTERVAL)
             
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
         # TODO: Logika do analizy statystyk i dynamicznej zmiany kosztów łączy
-        # self.logger.debug(f"Otrzymano statystyki przepływów z {ev.msg.datapath.id}")
+        # self.logger.debug("Otrzymano statystyki przepływów z {0}".format(ev.msg.datapath.id))
         pass
 
     def _cleanup_fft_loop(self):
@@ -382,8 +381,8 @@ class FAMTARController(app_manager.RyuApp):
             with self.fft_lock:
                 current_time = time.time()
                 expired_flows = [flow_id for flow_id, (_, timestamp) in self.fft.items()
-                                 if current_time - timestamp > FFT_IDLE_TIMEOUT]
+                                    if current_time - timestamp > FFT_IDLE_TIMEOUT]
                 if expired_flows:
-                    self.logger.info(f"Czyszczenie FFT: Usuwanie {len(expired_flows)} przestarzałych wpisów.")
+                    self.logger.info("Czyszczenie FFT: Usuwanie {0} przestarzałych wpisów.".format(len(expired_flows)))
                     for flow_id in expired_flows:
                         del self.fft[flow_id]
