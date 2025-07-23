@@ -161,6 +161,44 @@ class ProjectController(app_manager.RyuApp):
         command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=0,priority=0, instructions=inst)
         datapath.send_msg(mod)
 
+    # @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    # def _packet_in_handler(self, ev):
+    #     msg = ev.msg
+    #     datapath = msg.datapath
+    #     ofproto = datapath.ofproto
+    #     parser = datapath.ofproto_parser
+    #     in_port = msg.match['in_port']
+    #     pkt = packet.Packet(msg.data)
+    #     eth = pkt.get_protocol(ethernet.ethernet)
+        
+    #     #avoid broadcast from LLDP
+    #     if eth.ethertype==35020:
+    #         return
+    #     dst = eth.dst
+    #     src = eth.src
+    #     dpid = datapath.id
+    #     self.mac_to_port.setdefault(dpid, {})
+    #     if src not in mymac.keys():
+    #         mymac[src]=( dpid,  in_port)
+    #         #print "mymac=", mymac
+    #     if dst in mymac.keys():
+    #     # you can chose your topologi here
+    #         p = get_path(topo1, mymac[src][0], mymac[dst][0], mymac[src][1], mymac[dst][1])            
+    #         self.install_path(p, ev, src, dst)
+    #         out_port = p[0][2]
+    #     else:
+    #         out_port = ofproto.OFPP_FLOOD
+    #     actions = [parser.OFPActionOutput(out_port)]
+        
+    #     # install a flow to avoid packet_in next time
+    #     if out_port != ofproto.OFPP_FLOOD:
+    #         match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_dst=dst)
+    #     data=None
+    #     if msg.buffer_id==ofproto.OFP_NO_BUFFER:
+    #         data=msg.data
+    #     out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,actions=actions, data=data)
+    #     datapath.send_msg(out)
+	# EventSwitchEnter triggers get_topology_data method
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
@@ -171,34 +209,45 @@ class ProjectController(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         
-        #avoid broadcast from LLDP
-        if eth.ethertype==35020:
+        # avoid broadcast from LLDP
+        if eth.ethertype == 35020:
             return
+        
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
-        if src not in mymac.keys():
-            mymac[src]=( dpid,  in_port)
-            #print "mymac=", mymac
-        if dst in mymac.keys():
-        # you can chose your topologi here
-            p = get_path(topo1, mymac[src][0], mymac[dst][0], mymac[src][1], mymac[dst][1])            
-            self.install_path(p, ev, src, dst)
-            out_port = p[0][2]
+
+        if src not in mymac:
+            mymac[src] = (dpid, in_port)
+
+        if dst in mymac:
+            # Ensure src and dst are in mymac before using get_path
+            src_switch, src_port = mymac[src]
+            dst_switch, dst_port = mymac[dst]
+            
+            # Check that src and dst are valid before proceeding
+            if src_switch and dst_switch:
+                p = get_path(topo1, src_switch, dst_switch, src_port, dst_port)
+                self.install_path(p, ev, src, dst)
+                out_port = p[0][2]
+            else:
+                out_port = ofproto.OFPP_FLOOD
         else:
             out_port = ofproto.OFPP_FLOOD
+
         actions = [parser.OFPActionOutput(out_port)]
-        
+
         # install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_dst=dst)
-        data=None
-        if msg.buffer_id==ofproto.OFP_NO_BUFFER:
-            data=msg.data
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,actions=actions, data=data)
+        data = None
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+            data = msg.data
+        
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
-	# EventSwitchEnter triggers get_topology_data method
+
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
         global switches

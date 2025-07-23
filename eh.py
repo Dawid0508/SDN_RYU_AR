@@ -28,14 +28,14 @@ adjacency = defaultdict(lambda:defaultdict(lambda:None))
 
 
 # getting the node with lowest distance in Q
-def minimum_distance(distance, Q):
-    min = float('Inf')
-    node = 0
-    for v in Q:
-        if distance[v] < min:
-            min = distance[v]
-            node = v
-    return node
+# def minimum_distance(distance, Q):
+#     min = float('Inf')
+#     node = 0
+#     for v in Q:
+#         if distance[v] < min:
+#             min = distance[v]
+#             node = v
+#     return node
 
 def get_path (src, dst, first_port, final_port, weights):
     # executing Dijkstra's algorithm
@@ -59,9 +59,18 @@ def get_path (src, dst, first_port, final_port, weights):
     # checking for all undiscovered nodes whether there is a path that goes through them to their adjacent nodes which will make its adjacent nodes closer to src
     while len(Q) > 0:
         # getting the closest node to src among undiscovered nodes
-        u = minimum_distance(distance, Q)
-        # removing the node from Q
+        # u = minimum_distance(distance, Q)
+        # # removing the node from Q
+        # Q.remove(u)
+        # Znajdź wierzchołek w Q o najmniejszej odległości
+        u = min(Q, key=lambda v: distance[v])
+        
+        # Jeśli najmniejsza odległość to nieskończoność, to znaczy że reszta grafu jest nieosiągalna
+        if distance[u] == float('Inf'):
+            break
+
         Q.remove(u)
+        
         # calculate minimum distance for all adjacent nodes to u
         for p in switches:
             # if u and other switches are adjacent
