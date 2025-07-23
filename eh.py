@@ -21,7 +21,7 @@ from operator import attrgetter
 switches = []
 
 # mymacs[srcmac]->(switch, port)
-mymacs = {}
+# mymacs = {}
 
 # adjacency map [sw1][sw2]->port from sw1 to sw2
 adjacency = defaultdict(lambda:defaultdict(lambda:None))
@@ -134,6 +134,7 @@ class ProjectController(app_manager.RyuApp):
         
         # Statystyki do obliczania obciążenia
         self.link_stats = {} # Będzie przechowywać (timestamp, bytes) dla każdego linku
+        self.mymacs = {}
         
         # Próg kongestii w B/s (np. 50 Mbit/s = 6.25 MB/s)
         self.congestion_threshold = 6250000 
@@ -236,9 +237,9 @@ class ProjectController(app_manager.RyuApp):
         print("packet in. src=", src, " dst=", dst," dpid=", dpid)
 
         # add the host to the mymacs of the first switch that gets the packet
-        if src not in mymacs.keys():
-            mymacs[src] = (dpid, in_port)
-            print("mymacs=", mymacs)
+        if src not in self.mymacs.keys():
+            self.mymacs[src] = (dpid, in_port)
+            print("mymacs=", self.mymacs)
 
         flow_id = self._get_flow_id(pkt)
         
@@ -251,11 +252,11 @@ class ProjectController(app_manager.RyuApp):
             return
         
             # 2. To jest NOWY przepływ. Musimy znaleźć dla niego ścieżkę.
-        if dst in mymacs.keys():
+        if dst in self.mymacs.keys():
             print(f"New flow {flow_id}. Destination is known. Calculating path...")
             
             # Wywołujemy Dijkstrę z aktualnymi wagami!
-            p = get_path(mymacs[src][0], mymacs[dst][0], mymacs[src][1], mymacs[dst][1], self.link_weights)
+            p = get_path(self.mymacs[src][0], self.mymacs[dst][0], self.mymacs[src][1], self.mymacs[dst][1], self.link_weights)
             
             self.install_path(p, ev, src, dst)
             
