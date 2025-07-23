@@ -44,10 +44,15 @@ class FAMTARController(app_manager.RyuApp):
         self.mac_learning_lock = threading.Lock() # Zabezpiecza mac_to_dpid i mac_to_port
 
         # --- Uruchomienie zadań w tle w sposób zgodny z Ryu ---
+
+        self.logger.info("Kontroler FAMTAR zainicjowany. Wątki monitoringu i czyszczenia uruchomione.")
+        
+    def start(self):
+        """Metoda wywoływana po zainicjowaniu aplikacji, idealna do startowania pętli."""
+        super(FAMTARController, self).start()
         self.monitor_thread = self.hub.spawn(self._request_stats_loop)
         self.cleanup_thread = self.hub.spawn(self._cleanup_fft_loop)
-        self.logger.info("Kontroler FAMTAR zainicjowany. Wątki monitoringu i czyszczenia uruchomione.")
-
+        self.logger.info("Uruchomiono wątki monitoringu i czyszczenia FFT.")
     # --- Funkcje Pomocnicze jako metody klasy ---
 
     def _minimum_distance(self, distance, Q):
