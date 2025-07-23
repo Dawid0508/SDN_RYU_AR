@@ -15,6 +15,7 @@ from collections import defaultdict
 from ryu.lib.packet import ipv4, tcp, udp # <-- Potrzebne do identyfikacji przepływu
 from ryu.lib import hub                 # <-- Potrzebne do cyklicznego monitorowania
 import time # <-- Potrzebne do opóźnień w monitorowaniu
+from operator import attrgetter
 
 # switches
 switches = []
@@ -36,7 +37,7 @@ def minimum_distance(distance, Q):
             node = v
     return node
 
-def get_path (src, dst, first_port, final_port):
+def get_path (src, dst, first_port, final_port, weights):
     # executing Dijkstra's algorithm
     print( "get_path function is called, src=", src," dst=", dst, " first_port=", first_port, " final_port=", final_port)
     
@@ -114,14 +115,6 @@ class ProjectController(app_manager.RyuApp):
         super(ProjectController, self).__init__(*args, **kwargs)
         self.topology_api_app = self
         self.datapath_list = []
-
-    def install_path(self, p, ev, src_mac, dst_mac):
-        print("install_path function is called!")
-        #print( "p=", p, " src_mac=", src_mac, " dst_mac=", dst_mac)
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
         
         # --- NOWE STRUKTURY DANYCH DLA FAMTAR ---
         # Flow Forwarding Table: kluczem jest ID przepływu, wartością jest ścieżka
@@ -138,6 +131,15 @@ class ProjectController(app_manager.RyuApp):
         
         # Wątek do monitorowania sieci
         self.monitor_thread = hub.spawn(self._monitor)
+
+    def install_path(self, p, ev, src_mac, dst_mac):
+        print("install_path function is called!")
+        #print( "p=", p, " src_mac=", src_mac, " dst_mac=", dst_mac)
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        
         
         # adding path to flow table of each switch inside the shortest path
         for sw, in_port, out_port in p:
@@ -155,6 +157,27 @@ class ProjectController(app_manager.RyuApp):
             # finalizing the change to switch datapath
             datapath.send_msg(mod)
 
+    def _get_flow_id(self, pkt):
+        ip = pkt.get_protocol(ipv4.ipv4)
+        if ip:
+            src_ip = ip.src
+            dst_ip = ip.dst
+            proto = ip.proto
+            
+            if proto == 6: # TCP
+                t = pkt.get_protocol(tcp.tcp)
+                src_port = t.src_port
+                dst_port = t.dst_port
+                return (src_ip, dst_ip, proto, src_port, dst_port)
+            elif proto == 17: # UDP
+                u = pkt.get_protocol(udp.udp)
+                src_port = u.src_port
+                dst_port = u.dst_port
+                return (src_ip, dst_ip, proto, src_port, dst_port)
+                
+        # Jeśli to nie jest TCP/UDP, używamy MAC adresów jako fallback
+        eth = pkt.get_protocol(ethernet.ethernet)
+        return (eth.src, eth.dst)
 
     # defining event handler for setup and configuring of switches
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures , CONFIG_DISPATCHER)
@@ -194,7 +217,7 @@ class ProjectController(app_manager.RyuApp):
         eth = pkt.get_protocol(ethernet.ethernet)
 
         # avoid broadcasts from LLDP 
-        if eth.ethertype == 35020 or eth.ethertype == 34525:
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP or eth.ethertype == 34525:
             return
 
         # getting source and destination of the link
@@ -208,51 +231,125 @@ class ProjectController(app_manager.RyuApp):
             mymacs[src] = (dpid, in_port)
             print("mymacs=", mymacs)
 
-        # finding shortest path if destination exists in mymacs
+        flow_id = self._get_flow_id(pkt)
+        
+        if flow_id in self.fft:
+            # Można by tu odświeżać timestamp, jeśli chcemy usuwać nieaktywne przepływy
+            self.fft[flow_id]['timestamp'] = time.time()
+            # Ponieważ reguła dla tego przepływu już powinna istnieć, ten pakiet nie powinien
+            # w ogóle dotrzeć do kontrolera. Jeśli dotarł, to znaczy że coś jest nie tak,
+            # ale na razie ignorujemy ten pakiet, aby uniknąć pętli.
+            return
+        
+            # 2. To jest NOWY przepływ. Musimy znaleźć dla niego ścieżkę.
         if dst in mymacs.keys():
-            print("destination is known.")
-            p = get_path(mymacs[src][0], mymacs[dst][0], mymacs[src][1], mymacs[dst][1])
+            print(f"New flow {flow_id}. Destination is known. Calculating path...")
+            
+            # Wywołujemy Dijkstrę z aktualnymi wagami!
+            p = get_path(mymacs[src][0], mymacs[dst][0], mymacs[src][1], mymacs[dst][1], self.link_weights)
+            
             self.install_path(p, ev, src, dst)
-            print("installed path=", p)
+            
+            # Dodajemy przepływ do naszej tabeli FFT
+            self.fft[flow_id] = {'path': p, 'timestamp': time.time()}
+            
+            print(f"Installed path for new flow: {p}")
             out_port = p[0][2]
         else:
-            print("destination is unknown.Flood has happened.")
+            # Jeśli cel nieznany, zalewamy jak wcześniej
+            print("Destination is unknown. Flood has happened.")
             out_port = ofproto.OFPP_FLOOD
 
-        # getting actions part of the flow table
         actions = [parser.OFPActionOutput(out_port)]
-
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
                                     actions=actions, data=data)
         datapath.send_msg(out)
-
     
     # defining an event handler for adding/deleting of switches, hosts, ports and links event
     events = [event.EventSwitchEnter,
                 event.EventSwitchLeave, event.EventPortAdd,
                 event.EventPortDelete, event.EventPortModify,
                 event.EventLinkAdd, event.EventLinkDelete]
+    def _monitor(self):
+        while True:
+            for dp in self.datapath_list:
+                self._request_stats(dp)
+            hub.sleep(5) # Czekaj 5 sekund
+
+    # Metoda do wysyłania zapytań o statystyki
+    def _request_stats(self, datapath):
+        self.logger.debug('send stats request: %016x', datapath.id)
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        datapath.send_msg(req)
+
+    # Handler odpowiedzi na zapytania o statystyki
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        body = ev.msg.body
+        dpid = ev.msg.datapath.id
+        for stat in sorted(body, key=attrgetter('port_no')):
+            port_no = stat.port_no
+            if port_no != ofproto_v1_3.OFPP_LOCAL:
+                key = (dpid, port_no)
+                tx_bytes = stat.tx_bytes
+
+                if key in self.link_stats:
+                    # Oblicz przepustowość
+                    last_time, last_bytes = self.link_stats[key]
+                    time_diff = time.time() - last_time
+                    bytes_diff = tx_bytes - last_bytes
+                    
+                    if time_diff > 0:
+                        bandwidth = bytes_diff / time_diff # w B/s
+                        
+                        # Znajdź do którego przełącznika prowadzi ten link
+                        dst_dpid = None
+                        for neighbor in adjacency[dpid]:
+                            # Sprawdź czy port prowadzący do tego sąsiada to ten, dla którego mamy statystyki
+                            if adjacency[dpid][neighbor] == port_no:
+                                dst_dpid = neighbor
+                                break
+                        
+                        if dst_dpid:
+                            link = (dpid, dst_dpid)
+                            # Aktualizuj wagi na podstawie kongestii
+                            if bandwidth > self.congestion_threshold:
+                                if self.link_weights[link[0]][link[1]] == 1:
+                                    print(f"CONGESTION DETECTED on link {link}! Bw: {bandwidth/125000:.2f} Mbps. Increasing cost.")
+                                    self.link_weights[link[0]][link[1]] = 9999 # Duży koszt
+                            else:
+                                if self.link_weights[link[0]][link[1]] > 1:
+                                    print(f"Congestion on link {link} has ended. Restoring cost.")
+                                    self.link_weights[link[0]][link[1]] = 1 # Wracamy do normalnego kosztu
+                
+            # Zapisz aktualny stan do późniejszego porównania
+            self.link_stats[key] = (time.time(), tx_bytes)
+        
     @set_ev_cls(events)
     def get_topology_data(self, ev):
         global switches
         print("get_topology_data is called.")
-        # getting the list of known switches 
         switch_list = get_switch(self.topology_api_app, None)  
         switches = [switch.dp.id for switch in switch_list]
-        print("current known switches=", switches)
-        # getting the list of datapaths from the list of switches
         self.datapath_list = [switch.dp for switch in switch_list]
-        # sorting the datapath list based on their id so that indexing them in install_function will be correct
         self.datapath_list.sort(key=lambda dp: dp.id)
 
-        # getting the list of links between switches
         links_list = get_link(self.topology_api_app, None)
         mylinks = [(link.src.dpid,link.dst.dpid,link.src.port_no,link.dst.port_no) for link in links_list]
 
-        # setting adjacency of nodes
+        # <<< ZMIANA TUTAJ >>>
+        # Inicjalizuj wagi za każdym razem, gdy zmienia się topologia
+        self.link_weights = defaultdict(lambda: defaultdict(lambda: 1))
+        
         for s1, s2, port1, port2 in mylinks:
             adjacency[s1][s2] = port1
-            adjacency[s2][s1] = port2 
+            adjacency[s2][s1] = port2
+            
+            # Ustawiamy domyślną wagę 1 dla każdego nowo odkrytego linku
+            self.link_weights[s1][s2] = 1
+            self.link_weights[s2][s1] = 1
