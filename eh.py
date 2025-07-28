@@ -107,30 +107,36 @@ class ProjectController(app_manager.RyuApp):
         # Wątek do monitorowania sieci
         self.monitor_thread = hub.spawn(self._monitor)
 
-    def install_path(self, p, ev, src_mac, dst_mac):
-        print("install_path function is called!")
-        #print( "p=", p, " src_mac=", src_mac, " dst_mac=", dst_mac)
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        
-        
-        # adding path to flow table of each switch inside the shortest path
-        for sw, in_port, out_port in p:
-            #print( src_mac,"->", dst_mac, "via ", sw, " in_port=", in_port, " out_port=", out_port)
-            # setting match part of the flow table
+    def _install_flow_rules(self, path, src_mac, dst_mac):
+        """Instaluje reguły przepływu dla danej ścieżki i kierunku."""
+        ofproto = self.datapaths[path[0][0]].ofproto
+        parser = self.datapaths[path[0][0]].ofproto_parser
+
+        for sw_dpid, in_port, out_port in path:
+            datapath = self.datapaths[sw_dpid]
             match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
-            # setting actions part of the flow table
             actions = [parser.OFPActionOutput(out_port)]
-            # getting the datapath
-            datapath = self.datapaths[sw]
-            # getting instructions based on the actions
-            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS , actions)]
-            mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, match=match, idle_timeout=0, hard_timeout=0,
-                                                    priority=1, instructions=inst)
-            # finalizing the change to switch datapath
+            
+            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+            mod = parser.OFPFlowMod(datapath=datapath, match=match, idle_timeout=30, hard_timeout=60,
+                                    priority=1, instructions=inst)
             datapath.send_msg(mod)
+    def install_bidirectional_path(self, forward_path, src_mac, dst_mac):
+        """Instaluje ścieżki w obu kierunkach (forward i reverse)."""
+        print(f"Installing BIDIRECTIONAL path for {src_mac} <-> {dst_mac}")
+
+        # 1. Instaluj ścieżkę "do przodu"
+        self._install_flow_rules(forward_path, src_mac, dst_mac)
+
+        # 2. Stwórz i instaluj ścieżkę "powrotną"
+        reverse_path = []
+        # Iterujemy po ścieżce "do przodu" od końca
+        for sw_dpid, in_port, out_port in reversed(forward_path):
+            # W ścieżce powrotnej port wejściowy to stary wyjściowy, a wyjściowy to stary wejściowy
+            reverse_path.append((sw_dpid, out_port, in_port))
+        
+        # Instalujemy reguły dla ścieżki powrotnej, zamieniając MAC adresy
+        self._install_flow_rules(reverse_path, dst_mac, src_mac)
 
     def _get_flow_id(self, pkt):
         ip = pkt.get_protocol(ipv4.ipv4)
@@ -178,66 +184,74 @@ class ProjectController(app_manager.RyuApp):
 
 
     # defining an event handler for packets coming to switches event
+    # Wewnątrz klasy ProjectController
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        # getting msg, datapath, ofproto and parser objects
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        # getting the port switch received the packet with
         in_port = msg.match['in_port']
-        # creating a packet encoder/decoder class with the raw data obtained by msg
         pkt = packet.Packet(msg.data)
-        # getting the protocl that matches the received packet
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # avoid broadcasts from LLDP 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP or eth.ethertype == 34525:
             return
 
-        # getting source and destination of the link
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
         print("packet in. src=", src, " dst=", dst," dpid=", dpid)
 
-        # add the host to the mymacs of the first switch that gets the packet
         if src not in self.mymacs.keys():
             self.mymacs[src] = (dpid, in_port)
             print("mymacs=", self.mymacs)
 
-        flow_id = self._get_flow_id(pkt)
-        
-        if flow_id in self.fft:
-            # Można by tu odświeżać timestamp, jeśli chcemy usuwać nieaktywne przepływy
-            self.fft[flow_id]['timestamp'] = time.time()
-            # Ponieważ reguła dla tego przepływu już powinna istnieć, ten pakiet nie powinien
-            # w ogóle dotrzeć do kontrolera. Jeśli dotarł, to znaczy że coś jest nie tak,
-            # ale na razie ignorujemy ten pakiet, aby uniknąć pętli.
-            return
-        
-            # 2. To jest NOWY przepływ. Musimy znaleźć dla niego ścieżkę.
-        if dst in self.mymacs.keys():
-            print(f"New flow {flow_id}. Destination is known. Calculating path...")
-            
-            # Wywołujemy Dijkstrę z aktualnymi wagami!
-            p = get_path(self.mymacs[src][0], self.mymacs[dst][0],
-            self.mymacs[src][1], self.mymacs[dst][1],
-            self.link_weights, self.switches, self.adjacency) # MUSZĄ BYĆ self.switches i self.adjacency
-            
-            self.install_path(p, ev, src, dst)
-            
-            # Dodajemy przepływ do naszej tabeli FFT
-            self.fft[flow_id] = {'path': p, 'timestamp': time.time()}
-            
-            print(f"Installed path for new flow: {p}")
-            out_port = p[0][2]
-        else:
-            # Jeśli cel nieznany, zalewamy jak wcześniej
-            print("Destination is unknown. Flood has happened.")
-            out_port = ofproto.OFPP_FLOOD
+        # --- NOWA, DWUKIERUNKOWA LOGIKA ---
 
+        # Jeśli cel jest znany, instalujemy ścieżkę w obie strony
+        if dst in self.mymacs.keys():
+            # Sprawdzamy, czy przepływ nie został już obsłużony
+            forward_flow_id = self._get_flow_id(pkt)
+            if forward_flow_id in self.fft:
+                return
+
+            print(f"New flow between known hosts {src} -> {dst}. Calculating path...")
+            
+            # Oblicz ścieżkę "do przodu"
+            path = get_path(self.mymacs[src][0], self.mymacs[dst][0],
+                            self.mymacs[src][1], self.mymacs[dst][1],
+                            self.link_weights, self.switches, self.adjacency)
+            
+            if not path:
+                print("Path could not be found.")
+                return
+
+            # Instaluj ścieżki w OBU kierunkach
+            self.install_bidirectional_path(path, src, dst)
+            
+            # Dodaj OBA przepływy do FFT
+            # Stworzenie ID dla przepływu powrotnego przez zamianę MAC adresów
+            reverse_flow_id = (dst, src) if isinstance(forward_flow_id, tuple) and len(forward_flow_id) == 2 else \
+                            (forward_flow_id[1], forward_flow_id[0], forward_flow_id[2], forward_flow_id[4], forward_flow_id[3])
+
+            self.fft[forward_flow_id] = {'path': path, 'timestamp': time.time()}
+            self.fft[reverse_flow_id] = {'path': "reverse_installed", 'timestamp': time.time()}
+            
+            print(f"Installed FORWARD path: {path}")
+
+            # Wyślij ORYGINALNY pakiet, który to wszystko wywołał, tą nowo utworzoną ścieżką
+            out_port = path[0][2]
+            actions = [parser.OFPActionOutput(out_port)]
+            data = msg.data
+            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
+                                        actions=actions, data=data)
+            datapath.send_msg(out)
+            return
+
+        # Jeśli cel jest nieznany, zalewamy (standardowa obsługa ARP)
+        out_port = ofproto.OFPP_FLOOD
         actions = [parser.OFPActionOutput(out_port)]
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
@@ -245,12 +259,7 @@ class ProjectController(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
                                     actions=actions, data=data)
         datapath.send_msg(out)
-    
-    # defining an event handler for adding/deleting of switches, hosts, ports and links event
-    events = [event.EventSwitchEnter,
-                event.EventSwitchLeave, event.EventPortAdd,
-                event.EventPortDelete, event.EventPortModify,
-                event.EventLinkAdd, event.EventLinkDelete]
+        
     def _monitor(self):
         while True:
             for dp in self.datapath_list:
