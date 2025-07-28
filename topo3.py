@@ -6,6 +6,7 @@ from mininet.node import Controller, RemoteController
 from mininet.cli import CLI
 from mininet.link import TCLink
 from mininet.log import setLogLevel, info
+import time
 
 class MyTopo(Topo):
     def build(self):
@@ -33,6 +34,8 @@ def run_topo():
 
     net.start()
     info('*** Starting Network\n')
+    info('*** Waiting for network to converge...\n')
+    time.sleep(5)
     CLI(net)
     net.stop()
 
