@@ -1,4 +1,5 @@
 # last_dance.py
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
@@ -15,57 +16,45 @@ class ProjectController(app_manager.RyuApp):
         super(ProjectController, self).__init__(*args, **kwargs)
         self.topology_api_app = self
         
-        # --- Wszystkie zmienne stanu są teraz wewnątrz klasy (bez globalnych) ---
         self.switches = []
-        self.datapaths = {}  # Słownik do bezpiecznego odnajdywania obiektów datapath
+        self.datapaths = {}
         self.mymac = {}
         self.adjacency = defaultdict(lambda: defaultdict(lambda: None))
 
     def _get_path(self, src, dst, first_port, final_port):
-        """
-        Poprawiona implementacja algorytmu Dijkstry.
-        Używa dynamicznie odkrytej topologii.
-        """
         self.logger.info(f"Obliczanie ścieżki: src_sw={src}, dst_sw={dst}")
 
         distance = {dpid: float('inf') for dpid in self.switches}
         previous = {dpid: None for dpid in self.switches}
         distance[src] = 0
         
-        # Używamy kopii, aby nie modyfikować oryginalnej listy
         Q = set(self.switches)
 
         while Q:
-            # Znajdź wierzchołek w Q o najmniejszej odległości (bardziej wydajne niż osobna funkcja)
             u = min(Q, key=lambda dpid: distance[dpid])
             Q.remove(u)
 
-            # Jeśli najkrótsza odległość to nieskończoność, reszta grafu jest nieosiągalna
             if distance[u] == float('inf'):
                 break
 
             for p in self.switches:
                 if self.adjacency[u].get(p) is not None:
-                    # Zakładamy, że waga każdego połączenia to 1 (liczymy skoki)
                     weight = 1
                     if distance[u] + weight < distance[p]:
                         distance[p] = distance[u] + weight
                         previous[p] = u
         
-        # Odtwórz ścieżkę
         path = []
         p = dst
         while p is not None:
             path.append(p)
-            p = previous[p]
+            p = previous.get(p)
         path.reverse()
         
-        # Sprawdź, czy ścieżka została znaleziona
         if src not in path:
             self.logger.error(f"Ścieżka z {src} do {dst} nie została znaleziona!")
             return None
 
-        # Dodaj porty do ścieżki
         path_with_ports = []
         in_port = first_port
         for s1, s2 in zip(path[:-1], path[1:]):
@@ -85,7 +74,7 @@ class ProjectController(app_manager.RyuApp):
         for sw_dpid, in_port, out_port in p:
             match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
             actions = [parser.OFPActionOutput(out_port)]
-            datapath = self.datapaths.get(sw_dpid) # Bezpieczne pobieranie obiektu datapath
+            datapath = self.datapaths.get(sw_dpid)
             
             if datapath:
                 inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
@@ -102,8 +91,7 @@ class ProjectController(app_manager.RyuApp):
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(
-            datapath=datapath, match=match, priority=0, instructions=inst)
+        mod = parser.OFPFlowMod(datapath=datapath, match=match, priority=0, instructions=inst)
         datapath.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -115,10 +103,6 @@ class ProjectController(app_manager.RyuApp):
         in_port = msg.match['in_port']
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
-
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            # ignoruj pakiety LLDP (służące do odkrywania topologii)
-            return
 
         dst = eth.dst
         src = eth.src
@@ -150,18 +134,15 @@ class ProjectController(app_manager.RyuApp):
                                     in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
 
-    # Ta funkcja reaguje na zmiany w topologii sieci
     @set_ev_cls([event.EventSwitchEnter, event.EventLinkAdd])
     def get_topology_data(self, ev):
         self.logger.info(f"Aktualizacja topologii - zdarzenie: {ev.__class__.__name__}")
 
-        # Aktualizuj listę przełączników i obiektów datapath
         switch_list = get_switch(self.topology_api_app, None)
         self.switches = [s.dp.id for s in switch_list]
         self.datapaths = {s.dp.id: s.dp for s in switch_list}
         self.logger.info(f"Dostępne przełączniki: {self.switches}")
-
-        # Aktualizuj listę połączeń (macierz sąsiedztwa)
+        
         links_list = get_link(self.topology_api_app, None)
         self.adjacency.clear()
         for link in links_list:
@@ -169,4 +150,4 @@ class ProjectController(app_manager.RyuApp):
             port1, port2 = link.src.port_no, link.dst.port_no
             self.adjacency[s1][s2] = port1
             self.adjacency[s2][s1] = port2
-        self.logger.info(f"Odkryte połączenia: {self.adjacency.keys()}")
+        self.logger.info(f"Odkryte połączenia: {[ (l.src.dpid, l.dst.dpid) for l in links_list]}")
