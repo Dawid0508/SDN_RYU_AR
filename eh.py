@@ -1,121 +1,16 @@
+# eh.py
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.mac import haddr_to_bin
-from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet
-from ryu.lib.packet import ether_types
-from ryu.lib import mac
+from ryu.lib.packet import packet, ethernet, ether_types, ipv4, tcp, udp
 from ryu.topology.api import get_switch, get_link
-from ryu.app.wsgi import ControllerBase
-from ryu.topology import event, switches
+from ryu.topology import event
 from collections import defaultdict
-from ryu.lib.packet import ipv4, tcp, udp # <-- Potrzebne do identyfikacji przepływu
-from ryu.lib import hub                 # <-- Potrzebne do cyklicznego monitorowania
-import time # <-- Potrzebne do opóźnień w monitorowaniu
+from ryu.lib import hub
+import time
 from operator import attrgetter
-
-# switches
-switches = []
-
-# mymacs[srcmac]->(switch, port)
-# mymacs = {}
-
-# adjacency map [sw1][sw2]->port from sw1 to sw2
-adjacency = defaultdict(lambda:defaultdict(lambda:None))
-
-
-# getting the node with lowest distance in Q
-# def minimum_distance(distance, Q):
-#     min = float('Inf')
-#     node = 0
-#     for v in Q:
-#         if distance[v] < min:
-#             min = distance[v]
-#             node = v
-#     return node
-
-def get_path (src, dst, first_port, final_port, weights):
-    # executing Dijkstra's algorithm
-    print( "get_path function is called, src=", src," dst=", dst, " first_port=", first_port, " final_port=", final_port)
-    
-    # defining dictionaries for saving each node's distance and its previous node in the path from first node to that node
-    distance = {}
-    previous = {}
-
-    # setting initial distance of every node to infinity
-    for dpid in switches:
-        distance[dpid] = float('Inf')
-        previous[dpid] = None
-
-    # setting distance of the source to 0
-    distance[src] = 0
-
-    # creating a set of all nodes
-    Q = set(switches)
-
-    # checking for all undiscovered nodes whether there is a path that goes through them to their adjacent nodes which will make its adjacent nodes closer to src
-    while len(Q) > 0:
-        # getting the closest node to src among undiscovered nodes
-        # u = minimum_distance(distance, Q)
-        # # removing the node from Q
-        # Q.remove(u)
-        # Znajdź wierzchołek w Q o najmniejszej odległości
-        u = min(Q, key=lambda v: distance[v])
-        
-        # Jeśli najmniejsza odległość to nieskończoność, to znaczy że reszta grafu jest nieosiągalna
-        if distance[u] == float('Inf'):
-            break
-
-        Q.remove(u)
-        
-        # calculate minimum distance for all adjacent nodes to u
-        for p in switches:
-            # if u and other switches are adjacent
-            if adjacency[u][p] != None:
-                # setting the weight to 1 so that we count the number of routers in the path
-                # w = 1
-                w = weights[u][p]
-                # if the path via u to p has lower cost then make the cost equal to this new path's cost
-                if distance[u] + w < distance[p]:
-                    distance[p] = distance[u] + w
-                    previous[p] = u
-
-    # creating a list of switches between src and dst which are in the shortest path obtained by Dijkstra's algorithm reversely
-    r = []
-    p = dst
-    r.append(p)
-    # set q to the last node before dst 
-    q = previous[p]
-    while q is not None:
-        if q == src:
-            r.append(q)
-            break
-        p = q
-        r.append(p)
-        q = previous[p]
-
-    # reversing r as it was from dst to src
-    r.reverse()
-
-    # setting path 
-    if src == dst:
-        path=[src]
-    else:
-        path=r
-
-    # Now adding in_port and out_port to the path
-    r = []
-    in_port = first_port
-    for s1, s2 in zip(path[:-1], path[1:]):
-        out_port = adjacency[s1][s2]
-        r.append((s1, in_port, out_port))
-        in_port = adjacency[s2][s1]
-    r.append((dst, in_port, final_port))
-    return r
-
 
 class ProjectController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -123,181 +18,212 @@ class ProjectController(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(ProjectController, self).__init__(*args, **kwargs)
         self.topology_api_app = self
-        self.datapath_list = []
         
-        # --- NOWE STRUKTURY DANYCH DLA FAMTAR ---
-        # Flow Forwarding Table: kluczem jest ID przepływu, wartością jest ścieżka
-        self.fft = {}
-        
-        # Wagi linków: kluczem jest krotka (dpid1, dpid2), wartością jest koszt
-        self.link_weights = defaultdict(lambda: defaultdict(lambda: 1))
-        
-        # Statystyki do obliczania obciążenia
-        self.link_stats = {} # Będzie przechowywać (timestamp, bytes) dla każdego linku
+        # --- All state is now part of the class instance ---
+        self.switches = []
+        self.datapaths = {}  # Using a dictionary for robust lookup
+        self.adjacency = defaultdict(lambda: defaultdict(lambda: None))
         self.mymacs = {}
         
-        # Próg kongestii w B/s (np. 50 Mbit/s = 6.25 MB/s)
-        self.congestion_threshold = 6250000 
+        # --- FAMTAR data structures ---
+        self.fft = {}
+        self.link_weights = defaultdict(lambda: defaultdict(lambda: 1))
+        self.link_stats = {}
+        self.congestion_threshold = 6250000  # 50 Mbit/s in B/s
         
-        # Wątek do monitorowania sieci
+        # Monitoring thread
         self.monitor_thread = hub.spawn(self._monitor)
+        self.logger.info("ProjectController application running...")
 
-    def install_path(self, p, ev, src_mac, dst_mac):
-        print("install_path function is called!")
-        #print( "p=", p, " src_mac=", src_mac, " dst_mac=", dst_mac)
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+    def _get_path(self, src, dst, first_port, final_port):
+        """
+        Dijkstra's algorithm to find the shortest path.
+        This is now a method of the class and uses self.switches and self.adjacency.
+        """
+        self.logger.info(f"get_path function is called, src={src} dst={dst} first_port={first_port} final_port={final_port}")
         
-        
-        # adding path to flow table of each switch inside the shortest path
-        for sw, in_port, out_port in p:
-            #print( src_mac,"->", dst_mac, "via ", sw, " in_port=", in_port, " out_port=", out_port)
-            # setting match part of the flow table
-            match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
-            # setting actions part of the flow table
-            actions = [parser.OFPActionOutput(out_port)]
-            # getting the datapath
-            datapath = self.datapath_list[int(sw)-1]
-            # getting instructions based on the actions
-            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS , actions)]
-            mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, match=match, idle_timeout=0, hard_timeout=0,
-                                                    priority=1, instructions=inst)
-            # finalizing the change to switch datapath
-            datapath.send_msg(mod)
+        distance = {}
+        previous = {}
+        weights = self.link_weights # Use class attribute for weights
 
-    def _get_flow_id(self, pkt):
-        ip = pkt.get_protocol(ipv4.ipv4)
-        if ip:
-            src_ip = ip.src
-            dst_ip = ip.dst
-            proto = ip.proto
+        for dpid in self.switches:
+            distance[dpid] = float('Inf')
+            previous[dpid] = None
+
+        distance[src] = 0
+        Q = set(self.switches)
+
+        while Q:
+            u = min(Q, key=lambda v: distance[v])
+            if distance[u] == float('Inf'):
+                break # All remaining vertices are inaccessible from source
+            Q.remove(u)
             
-            if proto == 6: # TCP
-                t = pkt.get_protocol(tcp.tcp)
-                src_port = t.src_port
-                dst_port = t.dst_port
-                return (src_ip, dst_ip, proto, src_port, dst_port)
-            elif proto == 17: # UDP
-                u = pkt.get_protocol(udp.udp)
-                src_port = u.src_port
-                dst_port = u.dst_port
-                return (src_ip, dst_ip, proto, src_port, dst_port)
-                
-        # Jeśli to nie jest TCP/UDP, używamy MAC adresów jako fallback
-        eth = pkt.get_protocol(ethernet.ethernet)
-        return (eth.src, eth.dst)
+            for p in self.switches:
+                if self.adjacency[u][p] is not None:
+                    w = weights[u][p]
+                    if distance[u] + w < distance[p]:
+                        distance[p] = distance[u] + w
+                        previous[p] = u
 
-    # defining event handler for setup and configuring of switches
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures , CONFIG_DISPATCHER)
-    def switch_features_handler(self , ev):
-        print("switch_features_handler function is called")
-        # getting the datapath, ofproto and parser objects of the event
+        path = []
+        p = dst
+        while p is not None:
+            path.append(p)
+            p = previous[p]
+        
+        path.reverse()
+
+        if src not in path:
+            self.logger.error(f"Path not found from {src} to {dst}")
+            return []
+
+        r = []
+        in_port = first_port
+        for s1, s2 in zip(path[:-1], path[1:]):
+            out_port = self.adjacency[s1][s2]
+            r.append((s1, in_port, out_port))
+            in_port = self.adjacency[s2][s1]
+        
+        r.append((dst, in_port, final_port))
+        return r
+
+    def _install_path(self, p, ev, src_mac, dst_mac):
+        self.logger.info(f"install_path function is called for path: {p}")
+        msg = ev.msg
+        ofproto = msg.datapath.ofproto
+        parser = msg.datapath.ofproto_parser
+        
+        for sw_dpid, in_port, out_port in p:
+            match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
+            actions = [parser.OFPActionOutput(out_port)]
+            
+            # Use the robust dictionary lookup for the datapath object
+            datapath = self.datapaths.get(sw_dpid)
+            if datapath:
+                inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+                mod = parser.OFPFlowMod(
+                    datapath=datapath, match=match, priority=1,
+                    idle_timeout=10, hard_timeout=30, instructions=inst)
+                datapath.send_msg(mod)
+            else:
+                self.logger.error(f"Could not find datapath for dpid: {sw_dpid}")
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        # setting match condition to nothing so that it will match to anything
         match = parser.OFPMatch()
-        # setting action to send packets to OpenFlow Controller without buffering
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS , actions)]
-        # setting the priority to 0 so that it will be that last entry to match any packet inside any flow table
-        mod = datapath.ofproto_parser.OFPFlowMod(
-                            datapath=datapath, match=match, cookie=0,
-                            command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=0,
-                            priority=0, instructions=inst)
-        # finalizing the mod 
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(
+            datapath=datapath, match=match, cookie=0, command=ofproto.OFPFC_ADD,
+            idle_timeout=0, hard_timeout=0, priority=0, instructions=inst)
         datapath.send_msg(mod)
+        self.logger.info(f"Switch {datapath.id} connected and configured.")
 
-
-    # defining an event handler for packets coming to switches event
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        # getting msg, datapath, ofproto and parser objects
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        # getting the port switch received the packet with
         in_port = msg.match['in_port']
-        # creating a packet encoder/decoder class with the raw data obtained by msg
         pkt = packet.Packet(msg.data)
-        # getting the protocl that matches the received packet
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # avoid broadcasts from LLDP 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP or eth.ethertype == 34525:
             return
 
-        # getting source and destination of the link
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
-        print("packet in. src=", src, " dst=", dst," dpid=", dpid)
 
-        # add the host to the mymacs of the first switch that gets the packet
-        if src not in self.mymacs.keys():
+        if src not in self.mymacs:
             self.mymacs[src] = (dpid, in_port)
-            print("mymacs=", self.mymacs)
+            self.logger.info(f"Learned host {src} on switch {dpid} port {in_port}")
 
-        flow_id = self._get_flow_id(pkt)
-        
-        if flow_id in self.fft:
-            # Można by tu odświeżać timestamp, jeśli chcemy usuwać nieaktywne przepływy
-            self.fft[flow_id]['timestamp'] = time.time()
-            # Ponieważ reguła dla tego przepływu już powinna istnieć, ten pakiet nie powinien
-            # w ogóle dotrzeć do kontrolera. Jeśli dotarł, to znaczy że coś jest nie tak,
-            # ale na razie ignorujemy ten pakiet, aby uniknąć pętli.
-            return
-        
-            # 2. To jest NOWY przepływ. Musimy znaleźć dla niego ścieżkę.
-        if dst in self.mymacs.keys():
-            print(f"New flow {flow_id}. Destination is known. Calculating path...")
+        if dst in self.mymacs:
+            # Destination is known, calculate and install path
+            self.logger.info(f"New flow: {src} -> {dst}. Destination is known. Calculating path...")
             
-            # Wywołujemy Dijkstrę z aktualnymi wagami!
-            p = get_path(self.mymacs[src][0], self.mymacs[dst][0], self.mymacs[src][1], self.mymacs[dst][1], self.link_weights)
+            # Get path arguments
+            src_dpid = self.mymacs[src][0]
+            dst_dpid = self.mymacs[dst][0]
+            first_port = self.mymacs[src][1]
+            final_port = self.mymacs[dst][1]
             
-            self.install_path(p, ev, src, dst)
+            # Call the class method to get the path
+            path = self._get_path(src_dpid, dst_dpid, first_port, final_port)
             
-            # Dodajemy przepływ do naszej tabeli FFT
-            self.fft[flow_id] = {'path': p, 'timestamp': time.time()}
-            
-            print(f"Installed path for new flow: {p}")
-            out_port = p[0][2]
+            if path:
+                self.logger.info(f"Path found: {path}. Installing flow...")
+                self._install_path(path, ev, src, dst)
+                
+                # Send the current packet out the correct port on the first switch
+                out_port = path[0][2]
+            else:
+                self.logger.warning("Path not found, resorting to flooding.")
+                out_port = ofproto.OFPP_FLOOD
         else:
-            # Jeśli cel nieznany, zalewamy jak wcześniej
-            print("Destination is unknown. Flood has happened.")
+            # Destination is unknown, flood the packet
+            self.logger.info(f"Destination {dst} is unknown. Flooding packet from {src} on dpid {dpid}.")
             out_port = ofproto.OFPP_FLOOD
 
         actions = [parser.OFPActionOutput(out_port)]
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
-                                    actions=actions, data=data)
+        out = parser.OFPPacketOut(
+            datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
+            actions=actions, data=data)
         datapath.send_msg(out)
-    
-    # defining an event handler for adding/deleting of switches, hosts, ports and links event
-    events = [event.EventSwitchEnter,
-                event.EventSwitchLeave, event.EventPortAdd,
-                event.EventPortDelete, event.EventPortModify,
-                event.EventLinkAdd, event.EventLinkDelete]
+
+    @set_ev_cls(event.EventSwitchEnter)
+    def get_topology_data(self, ev):
+        """
+        This event handler is called when switches and links are added.
+        It updates the class's internal state.
+        """
+        self.logger.info("Topology changed. Refreshing data...")
+        
+        # Update switch and datapath information
+        switch_list = get_switch(self.topology_api_app, None)
+        self.switches = [s.dp.id for s in switch_list]
+        self.datapaths = {s.dp.id: s.dp for s in switch_list}
+        self.logger.info(f"Switches discovered: {self.switches}")
+        
+        # Update link information and adjacency matrix
+        links_list = get_link(self.topology_api_app, None)
+        self.adjacency = defaultdict(lambda: defaultdict(lambda: None)) # Reset adjacency
+        for link in links_list:
+            s1 = link.src.dpid
+            s2 = link.dst.dpid
+            port1 = link.src.port_no
+            port2 = link.dst.port_no
+            self.adjacency[s1][s2] = port1
+            self.adjacency[s2][s1] = port2
+            
+            # Initialize weights for new links
+            self.link_weights[s1][s2] = 1
+            self.link_weights[s2][s1] = 1
+        self.logger.info(f"Links discovered: {self.adjacency}")
+
+
+    # --- Monitoring and Congestion Control Methods (unchanged, but added logging) ---
     def _monitor(self):
         while True:
-            for dp in self.datapath_list:
+            for dp in self.datapaths.values():
                 self._request_stats(dp)
-            hub.sleep(5) # Czekaj 5 sekund
+            hub.sleep(5)
 
-    # Metoda do wysyłania zapytań o statystyki
     def _request_stats(self, datapath):
-        self.logger.debug('send stats request: %016x', datapath.id)
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(req)
 
-    # Handler odpowiedzi na zapytania o statystyki
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
         body = ev.msg.body
@@ -309,57 +235,27 @@ class ProjectController(app_manager.RyuApp):
                 tx_bytes = stat.tx_bytes
 
                 if key in self.link_stats:
-                    # Oblicz przepustowość
                     last_time, last_bytes = self.link_stats[key]
                     time_diff = time.time() - last_time
                     bytes_diff = tx_bytes - last_bytes
                     
                     if time_diff > 0:
-                        bandwidth = bytes_diff / time_diff # w B/s
-                        
-                        # Znajdź do którego przełącznika prowadzi ten link
+                        bandwidth = bytes_diff / time_diff  # B/s
                         dst_dpid = None
-                        for neighbor in adjacency[dpid]:
-                            # Sprawdź czy port prowadzący do tego sąsiada to ten, dla którego mamy statystyki
-                            if adjacency[dpid][neighbor] == port_no:
+                        for neighbor, port in self.adjacency[dpid].items():
+                            if port == port_no:
                                 dst_dpid = neighbor
                                 break
                         
                         if dst_dpid:
                             link = (dpid, dst_dpid)
-                            # Aktualizuj wagi na podstawie kongestii
                             if bandwidth > self.congestion_threshold:
                                 if self.link_weights[link[0]][link[1]] == 1:
-                                    print(f"CONGESTION DETECTED on link {link}! Bw: {bandwidth/125000:.2f} Mbps. Increasing cost.")
-                                    self.link_weights[link[0]][link[1]] = 9999 # Duży koszt
+                                    self.logger.warning(f"CONGESTION DETECTED on link {link}! Bw: {bandwidth/125000:.2f} Mbps. Increasing cost.")
+                                    self.link_weights[link[0]][link[1]] = 9999
                             else:
                                 if self.link_weights[link[0]][link[1]] > 1:
-                                    print(f"Congestion on link {link} has ended. Restoring cost.")
-                                    self.link_weights[link[0]][link[1]] = 1 # Wracamy do normalnego kosztu
+                                    self.logger.info(f"Congestion on link {link} has ended. Restoring cost.")
+                                    self.link_weights[link[0]][link[1]] = 1
                 
-            # Zapisz aktualny stan do późniejszego porównania
-            self.link_stats[key] = (time.time(), tx_bytes)
-        
-    @set_ev_cls(events)
-    def get_topology_data(self, ev):
-        global switches
-        print("get_topology_data is called.")
-        switch_list = get_switch(self.topology_api_app, None)  
-        switches = [switch.dp.id for switch in switch_list]
-        self.datapath_list = [switch.dp for switch in switch_list]
-        self.datapath_list.sort(key=lambda dp: dp.id)
-
-        links_list = get_link(self.topology_api_app, None)
-        mylinks = [(link.src.dpid,link.dst.dpid,link.src.port_no,link.dst.port_no) for link in links_list]
-
-        # <<< ZMIANA TUTAJ >>>
-        # Inicjalizuj wagi za każdym razem, gdy zmienia się topologia
-        self.link_weights = defaultdict(lambda: defaultdict(lambda: 1))
-        
-        for s1, s2, port1, port2 in mylinks:
-            adjacency[s1][s2] = port1
-            adjacency[s2][s1] = port2
-            
-            # Ustawiamy domyślną wagę 1 dla każdego nowo odkrytego linku
-            self.link_weights[s1][s2] = 1
-            self.link_weights[s2][s1] = 1
+                self.link_stats[key] = (time.time(), tx_bytes)
