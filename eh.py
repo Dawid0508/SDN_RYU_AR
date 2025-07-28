@@ -317,6 +317,11 @@ class ProjectController(app_manager.RyuApp):
             # Zapisz aktualny stan do późniejszego porównania
             self.link_stats[key] = (time.time(), tx_bytes)
         
+    # Definicja zdarzeń topologii, na które nasłuchujemy
+    events = [event.EventSwitchEnter,
+                event.EventSwitchLeave, event.EventPortAdd,
+                event.EventPortDelete, event.EventPortModify,
+                event.EventLinkAdd, event.EventLinkDelete]    
     @set_ev_cls(events)
     def get_topology_data(self, ev):
         
