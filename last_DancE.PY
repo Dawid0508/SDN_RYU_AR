@@ -7,6 +7,7 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet
 from ryu.topology import event
 from collections import defaultdict
+from ryu.lib.packet import ether_types
 
 class ProjectController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -126,39 +127,47 @@ class ProjectController(app_manager.RyuApp):
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        in_port = msg.match['in_port']
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
-        
-        # Ignorujemy pakiety inne niż IPv4, w tym ARP na początku
-        if eth.ethertype != ether_types.ETH_TYPE_IP:
-            return
-            
+
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
-        in_port = msg.match['in_port']
 
+        # Krok 1: Zawsze uczymy się adresu MAC hosta źródłowego
         if src not in self.mymac:
             self.mymac[src] = (dpid, in_port)
             self.logger.info(f"Nauczono: host {src} jest na przełączniku {dpid}, porcie {in_port}")
 
-        if dst in self.mymac:
-            src_switch, src_port = self.mymac[src]
-            dst_switch, dst_port = self.mymac[dst]
-            path = self._get_path(src_switch, dst_switch, src_port, dst_port)
-            if path:
-                self._install_path(path, ev, src, dst)
-                out_port = path[0][2]
+        # Krok 2: Obsługa pakietów ARP - zalewamy sieć, aby umożliwić odkrywanie
+        if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            self.logger.info(f"Otrzymano pakiet ARP, zalewanie sieci (flooding)...")
+            out_port = ofproto.OFPP_FLOOD
+            
+        # Krok 3: Obsługa pakietów IP - tu działa nasza logika wyznaczania ścieżek
+        elif eth.ethertype == ether_types.ETH_TYPE_IP:
+            if dst in self.mymac:
+                src_switch, src_port = self.mymac[src]
+                dst_switch, dst_port = self.mymac[dst]
+                path = self._get_path(src_switch, dst_switch, src_port, dst_port)
+                if path:
+                    self.logger.info("Instalowanie ścieżki dla przepływu IP...")
+                    self._install_path(path, ev, src, dst)
+                    out_port = path[0][2]
+                else:
+                    return # Jeśli nie ma ścieżki, nie rób nic
             else:
-                # Nie zalewamy już sieci, jeśli nie ma ścieżki
-                return
+                return # Jeśli cel nieznany, nie rób nic
         else:
-            # Nie zalewamy sieci, jeśli cel nieznany
+            # Ignoruj inne typy pakietów
             return
 
         actions = [parser.OFPActionOutput(out_port)]
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=data)
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                    in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
