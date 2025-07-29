@@ -4,15 +4,21 @@ from mininet.net import Mininet
 from mininet.node import RemoteController, OVSKernelSwitch
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
+from mininet.link import TCLink
 
 def create_topology():
     """
     Tworzy i uruchamia niestandardową topologię sieci.
     """
+    # Upewnij się, że Mininet jest czysty przed startem
+    # Chociaż 'mn -c' jest lepsze, to dodatkowe zabezpieczenie
+    
     net = Mininet(
         controller=lambda name: RemoteController(name, ip='127.0.0.1', port=6653),
         switch=OVSKernelSwitch,
-        autoSetMacs=True
+        link=TCLink,
+        autoSetMacs=True,
+        cleanup=True # Automatyczne czyszczenie po zamknięciu
     )
 
     info("*** Tworzenie hostów\n")
@@ -30,7 +36,7 @@ def create_topology():
     info("*** Tworzenie połączeń\n")
     # Hosty do przełączników
     net.addLink(h1, s1)
-    net.addLink(h2, s2)
+    net.addLink(h2, s2) # h2 podłączony do s2
     net.addLink(h3, s3)
     net.addLink(h4, s4)
 
@@ -39,7 +45,7 @@ def create_topology():
     net.addLink(s1, s3)
     net.addLink(s2, s4)
     net.addLink(s3, s4)
-    # Dodatkowe połączenie tworzące cykl, aby pokazać wybór najkrótszej ścieżki
+    # To połączenie jest kluczowe do testowania Dijkstry
     net.addLink(s1, s4) 
 
     info("*** Uruchamianie sieci\n")
