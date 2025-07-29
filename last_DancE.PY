@@ -18,6 +18,14 @@ class ProjectController(app_manager.RyuApp):
         self.switches = []
         self.datapaths = {}
         self.adjacency = defaultdict(dict) # Używamy dict zamiast defaultdict dla lepszej kontroli
+        
+        # Odzwierciedlenie przepustowości z Mininet (w Mbit/s)
+        self.link_bandwidths = {
+            (1, 2): 100, (2, 1): 100,  # s1 <-> s2
+            (2, 4): 100, (4, 2): 100,  # s2 <-> s4
+            (1, 3): 10,  (3, 1): 10,   # s1 <-> s3
+            (3, 4): 10,  (4, 3): 10    # s3 <-> s4
+        }
 
     # --- NOWE, ODDZIELNE HANDLERY TOPOLOGII ---
 
@@ -71,7 +79,14 @@ class ProjectController(app_manager.RyuApp):
 
             # Iterujemy po sąsiadach 'u' używając naszej mapy
             for p in self.adjacency[u].keys():
-                weight = 1
+                # weight = 1
+                bw = self.link_bandwidths.get((u, p), 0)
+                if bw > 0:
+                    # Używamy 1000 jako przepustowości referencyjnej
+                    weight = 1000 / bw
+                else:
+                    # Łącze bez zdefiniowanej przepustowości jest "nieskończenie drogie"
+                    weight = float('inf')
                 if distance[u] + weight < distance[p]:
                     distance[p] = distance[u] + weight
                     previous[p] = u
