@@ -80,22 +80,16 @@ class ProjectController(app_manager.RyuApp):
                 
                 if dst_dpid:
                     now = time.time()
-                    link = (dpid, dst_dpid)                   
-                    # Sprawdź, czy łącze jest w okresie "schładzania" po kongestii
-                    if link in self.congestion_cooldown and now < self.congestion_cooldown[link]:
-                        self.dynamic_costs[link] = 1000 # Utrzymaj wysoki koszt
-                        self.logger.info(f"Łącze {link} jest w okresie schładzania po kongestii. Koszt pozostaje wysoki.")
-                        self.link_stats[key] = (now, stat.tx_bytes)
-                        continue # Przejdź do następnego portu
+                    
                     # Obliczanie obciążenia
-                    elif key in self.link_stats:
+                    if key in self.link_stats:
                         last_time, last_bytes = self.link_stats[key]
                         time_diff = time.time() - last_time
                         bytes_diff = stat.tx_bytes - last_bytes
                         
                         if time_diff > 0:
                             bandwidth_usage = (bytes_diff * 8) / time_diff # Prędkość w bitach/s
-                            # link = (dpid, dst_dpid)
+                            link = (dpid, dst_dpid)
                             capacity_bps = self.link_capacity.get(link, 0) * 8 # Pojemność w bitach/s
                             
                             if capacity_bps > 0:

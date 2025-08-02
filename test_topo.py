@@ -43,7 +43,10 @@ def create_topology():
 
     info('*** Dodawanie hostów\n')
     h1 = net.addHost('h1', ip='10.0.0.1/24')
+    h2 = net.addHost('h2', ip='10.0.0.2/24')
+    h3 = net.addHost('h3', ip='10.0.0.3/24')
     h4 = net.addHost('h4', ip='10.0.0.4/24')
+
 
     info('*** Dodawanie przełączników\n')
     s1 = net.addSwitch('s1')
@@ -55,7 +58,9 @@ def create_topology():
     
     # Połączenia hostów z siecią
     net.addLink(h1, s1)
+    net.addLink(h2, s1)
     net.addLink(h4, s4)
+    net.addLink(h3, s4)  # Połączenie hosta h5 z przełącznikiem s4
 
     # ŚCIEŻKA SZYBKA (wysoka przepustowość = niski koszt dla algorytmu)
     # Parametr bw (bandwidth) jest podany w Mb/s
