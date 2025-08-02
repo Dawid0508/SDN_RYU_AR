@@ -92,11 +92,16 @@ class ProjectController(app_manager.RyuApp):
                                 load_percentage = (bandwidth_usage / capacity_bps) * 100
                                 
                                 # Dynamiczna zmiana kosztu
-                                if load_percentage > 80: # Próg 80% obciążenia
+                                if load_percentage > 90: # Próg 90% obciążenia
                                     self.dynamic_costs[link] = 1000 # Wysoki koszt dla zatłoczonego łącza
                                     self.logger.warning(f"KONGESJA na łączu {link}! Obciążenie: {load_percentage:.2f}%. Zwiększono koszt.")
                                 else:
-                                    self.dynamic_costs[link] = 1 # Niski koszt dla niezatłoczonego
+                                    # Oblicz koszt na podstawie przepustowości dla niezatłoczonego łącza
+                                    bw_mbps = self.link_capacity.get(link, 1) / 125000 # Przelicz pojemność na Mb/s
+                                    if bw_mbps > 0:
+                                        self.dynamic_costs[link] = 1000 / bw_mbps # koszt = ref / przepustowość
+                                    else:
+                                        self.dynamic_costs[link] = 1 # Domyślny koszt, jeśli coś pójdzie nie tak
                             
                     # Zapisz obecne statystyki do następnego porównania
                     self.link_stats[key] = (time.time(), stat.tx_bytes)
