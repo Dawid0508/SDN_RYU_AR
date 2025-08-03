@@ -124,7 +124,7 @@ class ProjectController(app_manager.RyuApp):
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
+                                in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
         
     #
@@ -163,10 +163,12 @@ class ProjectController(app_manager.RyuApp):
                 
                 if dst_dpid:
                     link = (dpid, dst_dpid)
+                    reverse_link = (dst_dpid, dpid)
                     now = time.time()
                     
                     if link in self.congestion_cooldown and now < self.congestion_cooldown[link]:
                         self.dynamic_costs[link] = 1000
+                        self.dynamic_costs[reverse_link] = 1000  # utrzymujemy wysoki koszt w przeciwnym kierunku
                         self.logger.info(f"Łącze {link} jest w okresie schładzania. Koszt pozostaje wysoki.")
                     
                     elif key in self.link_stats:
@@ -183,12 +185,14 @@ class ProjectController(app_manager.RyuApp):
                                 
                                 if load_percentage > 80:
                                     self.dynamic_costs[link] = 1000
+                                    self.dynamic_costs[reverse_link] = 1000  # wysoki koszt w przeciwnym kierunku
                                     self.congestion_cooldown[link] = now + 30
                                     self.logger.warning(f"KONGESJA na łączu {link}! Obciążenie: {load_percentage:.2f}%. Zwiększono koszt.")
                                 else:
                                     bw_mbps = self.link_capacity.get(link, 1) / 125000
                                     cost = 1000 / bw_mbps if bw_mbps > 0 else 1
                                     self.dynamic_costs[link] = cost
+                                    self.dynamic_costs[reverse_link] = cost  # utrzymujemy niski koszt w przeciwnym kierunku
                                     # self.logger.info(f"Łącze {link} - obciążenie {load_percentage:.2f}%, koszt: {cost:.2f}")
 
                     self.link_stats[key] = (now, stat.tx_bytes)
