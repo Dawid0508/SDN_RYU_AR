@@ -1,4 +1,4 @@
-# last_dance.py - WERSJA FINALNA z implementacją FAMTAR (FFT)
+# last_dance.py - WERSJA FINALNA z implementacją FAMTAR (FFT) i histerezą
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -20,13 +20,13 @@ class ProjectController(app_manager.RyuApp):
         self.switches = []
         self.datapaths = {}
         self.adjacency = defaultdict(dict)
-        self.congestion_cooldown = {}
+        
+        # Usunięto self.congestion_cooldown, ponieważ histereza jest lepszym mechanizmem
 
-        # --- NOWA TABLICA PRZEKAZYWANIA PRZEPŁYWÓW (FFT) ---
-        # Klucz: flow_id, Wartość: {'path': sciezka, 'timestamp': czas}
+        # Tablica Przekazywania Przepływów (FFT)
         self.fft = {}
 
-        # Statyczna przepustowość łączy z Mininet (w B/s)
+        # Statyczna przepustowość łączy (w B/s)
         self.link_capacity = {
             (1, 2): 12500000, (2, 1): 12500000,
             (2, 4): 12500000, (4, 2): 12500000,
@@ -39,38 +39,27 @@ class ProjectController(app_manager.RyuApp):
         self.monitor_thread = hub.spawn(self._monitor)
 
     def _get_flow_id(self, pkt):
-        """Tworzy unikalny identyfikator dla przepływu na podstawie 5-ciu pól."""
         pkt_ipv4 = pkt.get_protocol(ipv4.ipv4)
         pkt_tcp = pkt.get_protocol(tcp.tcp)
         pkt_udp = pkt.get_protocol(udp.udp)
 
         if pkt_ipv4:
-            src_ip = pkt_ipv4.src
-            dst_ip = pkt_ipv4.dst
-            proto = pkt_ipv4.proto
-
+            src_ip, dst_ip, proto = pkt_ipv4.src, pkt_ipv4.dst, pkt_ipv4.proto
             if pkt_tcp:
-                src_port = pkt_tcp.src_port
-                dst_port = pkt_tcp.dst_port
-                return (src_ip, src_port, dst_ip, dst_port, proto)
+                return (src_ip, pkt_tcp.src_port, dst_ip, pkt_tcp.dst_port, proto)
             elif pkt_udp:
-                src_port = pkt_udp.src_port
-                dst_port = pkt_udp.dst_port
-                return (src_ip, src_port, dst_ip, dst_port, proto)
+                return (src_ip, pkt_udp.src_port, dst_ip, pkt_udp.dst_port, proto)
         
-        # Fallback dla ruchu nie-TCP/UDP (np. ICMP)
         eth = pkt.get_protocol(ethernet.ethernet)
         return (eth.src, eth.dst, eth.ethertype)
 
     def _monitor(self):
-        """Pętla w tle, która co 10 sekund prosi przełączniki o statystyki."""
         while True:
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             hub.sleep(10)
 
     def _request_stats(self, datapath):
-        """Wysyła zapytanie OFPPortStatsRequest do danego przełącznika."""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
@@ -95,16 +84,10 @@ class ProjectController(app_manager.RyuApp):
                 if dst_dpid:
                     link = (dpid, dst_dpid)
                     reverse_link = (dst_dpid, dpid)
-                    now = time.time()
                     
-                    if link in self.congestion_cooldown and now < self.congestion_cooldown[link]:
-                        self.dynamic_costs[link] = 1000
-                        self.dynamic_costs[reverse_link] = 1000
-                        self.logger.info(f"Łącze {link} jest w okresie schładzania. Koszt pozostaje wysoki.")
-                    
-                    elif key in self.link_stats:
+                    if key in self.link_stats:
                         last_time, last_bytes = self.link_stats[key]
-                        time_diff = now - last_time
+                        time_diff = time.time() - last_time
                         bytes_diff = stat.tx_bytes - last_bytes
                         
                         if time_diff > 0:
@@ -114,19 +97,29 @@ class ProjectController(app_manager.RyuApp):
                             if capacity_bps > 0:
                                 load_percentage = (bandwidth_usage / capacity_bps) * 100
                                 
-                                if load_percentage > 80:
-                                    self.dynamic_costs[link] = 1000
-                                    self.dynamic_costs[reverse_link] = 1000
-                                    self.congestion_cooldown[link] = now + 30
-                                    self.congestion_cooldown[reverse_link] = now + 30
-                                    self.logger.warning(f"KONGESJA na łączu {link}! Obciążenie: {load_percentage:.2f}%. Zwiększono koszt w obu kierunkach.")
-                                else:
-                                    bw_mbps = self.link_capacity.get(link, 1) / 125000
-                                    cost = 1000 / bw_mbps if bw_mbps > 0 else 1
-                                    self.dynamic_costs[link] = cost
-                                    self.dynamic_costs[reverse_link] = cost
+                                # --- NOWA LOGIKA Z HISTEREZĄ ---
+                                th_max = 90.0 # Próg górny do wykrycia kongestji
+                                th_min = 70.0 # Próg dolny do usunięcia kongestji
 
-                    self.link_stats[key] = (now, stat.tx_bytes)
+                                if load_percentage > th_max:
+                                    # Zwiększ koszt tylko, jeśli nie jest już wysoki
+                                    if self.dynamic_costs[link] < 1000:
+                                        self.dynamic_costs[link] = 1000
+                                        self.dynamic_costs[reverse_link] = 1000
+                                        self.logger.warning(f"KONGESJA na łączu {link}! Obciążenie: {load_percentage:.2f}%. Zwiększono koszt.")
+                                
+                                elif load_percentage < th_min:
+                                    # Zmniejsz koszt tylko, jeśli był wcześniej wysoki
+                                    if self.dynamic_costs[link] > 1:
+                                        bw_mbps = self.link_capacity.get(link, 1) / 125000
+                                        cost = 1000 / bw_mbps if bw_mbps > 0 else 1
+                                        self.dynamic_costs[link] = cost
+                                        self.dynamic_costs[reverse_link] = cost
+                                        self.logger.info(f"Kongestia na łączu {link} ustąpiła. Obciążenie: {load_percentage:.2f}%. Przywrócono koszt: {cost:.2f}")
+                                
+                                # Jeśli obciążenie jest między 70% a 90%, koszt pozostaje bez zmian
+
+                    self.link_stats[key] = (time.time(), stat.tx_bytes)
 
     @set_ev_cls(event.EventSwitchEnter)
     def _switch_enter_handler(self, ev):
@@ -147,7 +140,6 @@ class ProjectController(app_manager.RyuApp):
         self.logger.info(f"Odkryto połączenie: {s1}:{port1} <-> {s2}:{port2}")
 
     def _get_path(self, src, dst, first_port, final_port):
-        self.logger.info(f"Obliczanie ścieżki: src_sw={src}, dst_sw={dst}")
         distance = {dpid: float('inf') for dpid in self.switches}
         previous = {dpid: None for dpid in self.switches}
         distance[src] = 0
@@ -161,7 +153,6 @@ class ProjectController(app_manager.RyuApp):
 
             for p in self.adjacency[u].keys():
                 weight = self.dynamic_costs.get((u, p), 1)
-                
                 if distance[u] + weight < distance[p]:
                     distance[p] = distance[u] + weight
                     previous[p] = u
@@ -192,29 +183,22 @@ class ProjectController(app_manager.RyuApp):
         msg = ev.msg
         parser = msg.datapath.ofproto_parser
         ofproto = msg.datapath.ofproto
-        
-        # Tworzymy unikalny identyfikator przepływu, aby móc instalować reguły dla konkretnych przepływów
         pkt = packet.Packet(msg.data)
         pkt_ipv4 = pkt.get_protocol(ipv4.ipv4)
         pkt_tcp = pkt.get_protocol(tcp.tcp)
         pkt_udp = pkt.get_protocol(udp.udp)
 
-        # Instalujemy reguły tylko dla ruchu IP
-        if not pkt_ipv4:
-            return
+        if not pkt_ipv4: return
 
         for sw_dpid, in_port, out_port in p:
-            # Dopasowanie jest teraz bardziej szczegółowe (5-pól)
             match = parser.OFPMatch(in_port=in_port, eth_type=ether_types.ETH_TYPE_IP, 
                                     ipv4_src=pkt_ipv4.src, ipv4_dst=pkt_ipv4.dst)
-            
-            # Dla TCP/UDP możemy dodać porty
             if pkt_tcp:
-                    match = parser.OFPMatch(in_port=in_port, eth_type=ether_types.ETH_TYPE_IP, 
+                match = parser.OFPMatch(in_port=in_port, eth_type=ether_types.ETH_TYPE_IP, 
                                     ipv4_src=pkt_ipv4.src, ipv4_dst=pkt_ipv4.dst,
                                     ip_proto=6, tcp_src=pkt_tcp.src_port, tcp_dst=pkt_tcp.dst_port)
             elif pkt_udp:
-                    match = parser.OFPMatch(in_port=in_port, eth_type=ether_types.ETH_TYPE_IP, 
+                match = parser.OFPMatch(in_port=in_port, eth_type=ether_types.ETH_TYPE_IP, 
                                     ipv4_src=pkt_ipv4.src, ipv4_dst=pkt_ipv4.dst,
                                     ip_proto=17, udp_src=pkt_udp.src_port, udp_dst=pkt_udp.dst_port)
 
@@ -222,7 +206,7 @@ class ProjectController(app_manager.RyuApp):
             datapath = self.datapaths.get(sw_dpid)
             if datapath:
                 inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-                mod = parser.OFPFlowMod(datapath=datapath, match=match, priority=2, # Wyższy priorytet
+                mod = parser.OFPFlowMod(datapath=datapath, match=match, priority=2,
                                         idle_timeout=20, hard_timeout=60, instructions=inst)
                 datapath.send_msg(mod)
 
@@ -250,9 +234,7 @@ class ProjectController(app_manager.RyuApp):
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
-        dst = eth.dst
-        src = eth.src
-        dpid = datapath.id
+        dst, src, dpid = eth.dst, eth.src, datapath.id
 
         if src not in self.mymac:
             self.mymac[src] = (dpid, in_port)
@@ -262,29 +244,22 @@ class ProjectController(app_manager.RyuApp):
             out_port = ofproto.OFPP_FLOOD
         else:
             flow_id = self._get_flow_id(pkt)
-
             if flow_id in self.fft:
                 path = self.fft[flow_id]['path']
                 self.fft[flow_id]['timestamp'] = time.time()
-                self.logger.info(f"Przepływ {flow_id} znaleziony w FFT. Używam ścieżki: {path}")
-                # Nie instalujemy ponownie ścieżki, bo reguły już powinny być
                 out_port = path[0][2]
             else:
                 if dst in self.mymac:
                     src_switch, src_port = self.mymac[src]
                     dst_switch, dst_port = self.mymac[dst]
-                    
                     path = self._get_path(src_switch, dst_switch, src_port, dst_port)
-                    
                     if path:
                         self.logger.info(f"Nowy przepływ {flow_id}. Dodaję do FFT ze ścieżką: {path}")
                         self.fft[flow_id] = {'path': path, 'timestamp': time.time()}
                         self._install_path(path, ev, src, dst)
                         out_port = path[0][2]
-                    else:
-                        return
-                else:
-                    return
+                    else: return
+                else: return
 
         actions = [parser.OFPActionOutput(out_port)]
         data = None
