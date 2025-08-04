@@ -221,50 +221,100 @@ class ProjectController(app_manager.RyuApp):
         mod = parser.OFPFlowMod(datapath=datapath, match=match, priority=0, instructions=inst)
         datapath.send_msg(mod)
 
+    # @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    # def _packet_in_handler(self, ev):
+    #     msg = ev.msg
+    #     datapath = msg.datapath
+    #     ofproto = datapath.ofproto
+    #     parser = datapath.ofproto_parser
+    #     in_port = msg.match['in_port']
+    #     pkt = packet.Packet(msg.data)
+    #     eth = pkt.get_protocol(ethernet.ethernet)
+
+    #     if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+    #         return
+
+    #     dst, src, dpid = eth.dst, eth.src, datapath.id
+
+    #     if src not in self.mymac:
+    #         self.mymac[src] = (dpid, in_port)
+    #         self.logger.info(f"Nauczono: host {src} jest na przełączniku {dpid}, porcie {in_port}")
+
+    #     if eth.ethertype == ether_types.ETH_TYPE_ARP:
+    #         out_port = ofproto.OFPP_FLOOD
+    #     else:
+    #         flow_id = self._get_flow_id(pkt)
+    #         if flow_id in self.fft:
+    #             path = self.fft[flow_id]['path']
+    #             self.fft[flow_id]['timestamp'] = time.time()
+    #             out_port = path[0][2]
+    #         else:
+    #             if dst in self.mymac:
+    #                 src_switch, src_port = self.mymac[src]
+    #                 dst_switch, dst_port = self.mymac[dst]
+    #                 path = self._get_path(src_switch, dst_switch, src_port, dst_port)
+    #                 if path:
+    #                     self.logger.info(f"Nowy przepływ {flow_id}. Dodaję do FFT ze ścieżką: {path}")
+    #                     self.fft[flow_id] = {'path': path, 'timestamp': time.time()}
+    #                     self._install_path(path, ev, src, dst)
+    #                     out_port = path[0][2]
+    #                 else: return
+    #             else: return
+
+    #     actions = [parser.OFPActionOutput(out_port)]
+    #     data = None
+    #     if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+    #         data = msg.data
+    #     out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+    #                                 in_port=in_port, actions=actions, data=data)
+    #     datapath.send_msg(out)
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        in_port = msg.match['in_port']
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
-
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            return
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP: return
 
         dst, src, dpid = eth.dst, eth.src, datapath.id
-
+        in_port = msg.match['in_port']
         if src not in self.mymac:
             self.mymac[src] = (dpid, in_port)
-            self.logger.info(f"Nauczono: host {src} jest na przełączniku {dpid}, porcie {in_port}")
+            self.logger.info(f"Nauczono: host {src} jest na {dpid}:{in_port}")
 
         if eth.ethertype == ether_types.ETH_TYPE_ARP:
             out_port = ofproto.OFPP_FLOOD
         else:
             flow_id = self._get_flow_id(pkt)
+            
+            # --- LOGIKA ZGODNA Z FAMTAR PDF ---
             if flow_id in self.fft:
+                # Przepływ jest znany. Używamy ścieżki z FFT.
+                # To, że pakiet dotarł do kontrolera, oznacza, że reguła na przełączniku wygasła.
+                # Musimy ją ponownie zainstalować, używając ZAPISANEJ ścieżki.
                 path = self.fft[flow_id]['path']
                 self.fft[flow_id]['timestamp'] = time.time()
+                self.logger.info(f"Reguła dla znanego przepływu {flow_id} wygasła. Ponownie instaluję ścieżkę z FFT: {path}")
+                self._install_path(path, ev)
                 out_port = path[0][2]
             else:
+                # To jest nowy przepływ. Obliczamy nową ścieżkę.
                 if dst in self.mymac:
-                    src_switch, src_port = self.mymac[src]
-                    dst_switch, dst_port = self.mymac[dst]
-                    path = self._get_path(src_switch, dst_switch, src_port, dst_port)
+                    src_sw, src_port = self.mymac[src]
+                    dst_sw, dst_port = self.mymac[dst]
+                    path = self._get_path(src_sw, dst_sw, src_port, dst_port)
                     if path:
-                        self.logger.info(f"Nowy przepływ {flow_id}. Dodaję do FFT ze ścieżką: {path}")
+                        self.logger.info(f"Nowy przepływ {flow_id}. Obliczono i dodano do FFT ścieżkę: {path}")
                         self.fft[flow_id] = {'path': path, 'timestamp': time.time()}
-                        self._install_path(path, ev, src, dst)
+                        self._install_path(path, ev)
                         out_port = path[0][2]
                     else: return
                 else: return
 
         actions = [parser.OFPActionOutput(out_port)]
         data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                    in_port=in_port, actions=actions, data=data)
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER: data = msg.data
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
+
